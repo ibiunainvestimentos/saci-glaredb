@@ -11,7 +11,6 @@ use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::{ident, Cast, LogicalPlan, TableProviderFilterPushDown, TableType};
 use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_expr::execution_props::ExecutionProps;
-use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{ExecutionPlan, Statistics};
 use datafusion::prelude::Expr;
@@ -423,52 +422,54 @@ impl TableProvider for NativeTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let num_rows = if let Some(stats) = self.statistics() {
-            stats.num_rows.get_value().copied().unwrap_or_default()
-        } else {
-            usize::default()
-        };
-
-        if num_rows == 0 {
-            let schema = self.schema();
-            Ok(Arc::new(EmptyExec::new(schema)))
-        } else {
-            let plan = self.delta.scan(session, projection, filters, limit).await?;
-            let output_schema = plan.schema();
-            let mut schema = self.schema();
-            if let Some(projection) = projection {
-                schema = Arc::new(schema.project(projection)?);
-            }
-            let df_schema = output_schema.clone().to_dfschema_ref()?;
-
-            let plan = if output_schema != schema {
-                let exprs = output_schema
-                    .fields()
-                    .into_iter()
-                    .zip(schema.fields())
-                    .map(|(f1, f2)| {
-                        let expr = if f1.data_type() == f2.data_type() {
-                            ident(f1.name())
-                        } else {
-                            let cast_expr =
-                                Cast::new(Box::new(ident(f1.name())), f2.data_type().clone());
-                            Expr::Cast(cast_expr)
-                        };
-                        let execution_props = ExecutionProps::new();
-                        (
-                            create_physical_expr(&expr, &df_schema, &execution_props).unwrap(),
-                            f1.name().clone(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let prj = ProjectionExec::try_new(exprs, plan)?;
-                // we need to do a projection to match the schema
-                Arc::new(prj)
-            } else {
-                plan
-            };
-            Ok(Arc::new(ReadOnlyDataSourceMetricsExecAdapter::new(plan)))
+        // NOTE: We intentionally do NOT short-circuit to `EmptyExec` when
+        // `self.statistics()` reports 0 rows. `Statistics::num_rows` is a
+        // `Precision<usize>` that can be `Absent` for perfectly valid tables —
+        // e.g., when any batch in the Delta log replay contains 0 `add`
+        // entries after filtering (common for prod checkpoints once the
+        // checkpoint grows past the 1024-row batch boundary) the
+        // `num_records` reducer folds `Absent` into the accumulator and the
+        // whole table's row-count goes missing.  Treating that as "empty" was
+        // returning 0 rows from `storage_*` external tables on Azure while
+        // the underlying Delta actually had millions of rows.
+        //
+        // Always delegate to the underlying Delta scan; it handles truly
+        // empty tables correctly (returns a plan with no partitions/files).
+        let plan = self.delta.scan(session, projection, filters, limit).await?;
+        let output_schema = plan.schema();
+        let mut schema = self.schema();
+        if let Some(projection) = projection {
+            schema = Arc::new(schema.project(projection)?);
         }
+        let df_schema = output_schema.clone().to_dfschema_ref()?;
+
+        let plan = if output_schema != schema {
+            let exprs = output_schema
+                .fields()
+                .into_iter()
+                .zip(schema.fields())
+                .map(|(f1, f2)| {
+                    let expr = if f1.data_type() == f2.data_type() {
+                        ident(f1.name())
+                    } else {
+                        let cast_expr =
+                            Cast::new(Box::new(ident(f1.name())), f2.data_type().clone());
+                        Expr::Cast(cast_expr)
+                    };
+                    let execution_props = ExecutionProps::new();
+                    (
+                        create_physical_expr(&expr, &df_schema, &execution_props).unwrap(),
+                        f1.name().clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let prj = ProjectionExec::try_new(exprs, plan)?;
+            // we need to do a projection to match the schema
+            Arc::new(prj)
+        } else {
+            plan
+        };
+        Ok(Arc::new(ReadOnlyDataSourceMetricsExecAdapter::new(plan)))
     }
 
     fn supports_filter_pushdown(
