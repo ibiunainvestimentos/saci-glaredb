@@ -385,7 +385,7 @@ fn dfscalar_to_json(value: &DfScalar) -> serde_json::Value {
         DfScalar::UInt8(Some(v)) => Value::Number((*v as u64).into()),
         DfScalar::UInt16(Some(v)) => Value::Number((*v as u64).into()),
         DfScalar::UInt32(Some(v)) => Value::Number((*v as u64).into()),
-        DfScalar::UInt64(Some(v)) => Value::Number(((*v) as u64).into()),
+        DfScalar::UInt64(Some(v)) => Value::Number((*v).into()),
         DfScalar::Float32(Some(v)) => f64_or_null(*v as f64),
         DfScalar::Float64(Some(v)) => f64_or_null(*v),
 
@@ -477,8 +477,14 @@ fn dfscalar_to_json(value: &DfScalar) -> serde_json::Value {
             let mut map = Map::with_capacity(arr.num_columns());
             for (i, field) in arr.fields().iter().enumerate() {
                 let col = arr.column(i);
-                let inner = DfScalar::try_from_array(col.as_ref(), 0)
-                    .unwrap_or(DfScalar::Null);
+                let inner = DfScalar::try_from_array(col.as_ref(), 0).unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "pgrepr: try_from_array failed for struct field {} ({:?}) — emitting null",
+                        field.name(),
+                        e
+                    );
+                    DfScalar::Null
+                });
                 map.insert(field.name().clone(), dfscalar_to_json(&inner));
             }
             Value::Object(map)
@@ -501,7 +507,14 @@ fn dfscalar_to_json(value: &DfScalar) -> serde_json::Value {
 fn list_to_json(inner: &dyn Array) -> serde_json::Value {
     let mut out = Vec::with_capacity(inner.len());
     for i in 0..inner.len() {
-        let elem = DfScalar::try_from_array(inner, i).unwrap_or(DfScalar::Null);
+        let elem = DfScalar::try_from_array(inner, i).unwrap_or_else(|e| {
+            tracing::warn!(
+                "pgrepr: try_from_array failed for list element {} ({:?}) — emitting null",
+                i,
+                e
+            );
+            DfScalar::Null
+        });
         out.push(dfscalar_to_json(&elem));
     }
     serde_json::Value::Array(out)
@@ -687,6 +700,65 @@ mod tests {
         assert_eq!(
             json,
             r#"[{"schedule_date":"2024-05-01 00:00:00","amort_pct":0.5},{"schedule_date":"2024-06-01 00:00:00","amort_pct":1.0}]"#
+        );
+    }
+
+    #[test]
+    fn json_struct_with_null_row_emits_json_null() {
+        // A 1-row StructArray whose row is null at the row level.
+        use datafusion::arrow::buffer::NullBuffer;
+        let type_arr = Arc::new(StringArray::from(vec![None::<&str>])) as _;
+        let strike_arr = Arc::new(Float64Array::from(vec![None::<f64>])) as _;
+        let fields_vec: Vec<(Arc<Field>, _)> = vec![
+            (
+                Arc::new(Field::new("type", DataType::Utf8, true)),
+                Arc::clone(&type_arr) as _,
+            ),
+            (
+                Arc::new(Field::new("strike", DataType::Float64, true)),
+                Arc::clone(&strike_arr),
+            ),
+        ];
+        let nulls = NullBuffer::from(vec![false]); // row 0 is null
+        let s = StructArray::new(
+            fields_vec
+                .iter()
+                .map(|(f, _)| Arc::clone(f))
+                .collect::<Vec<_>>()
+                .into(),
+            fields_vec.iter().map(|(_, a)| Arc::clone(a)).collect(),
+            Some(nulls),
+        );
+        assert_eq!(
+            dfscalar_to_json(&DfScalar::Struct(Arc::new(s))),
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn json_list_with_null_elements() {
+        // [1, null, 3]
+        let values = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
+        let offsets = OffsetBuffer::new(vec![0, 3].into());
+        let field = Arc::new(Field::new("item", DataType::Int32, true));
+        let list = ListArray::new(field, offsets, values, None);
+        assert_eq!(
+            dfscalar_to_json(&DfScalar::List(Arc::new(list))).to_string(),
+            "[1,null,3]"
+        );
+    }
+
+    #[test]
+    fn json_decimal128_negative_and_zero_scale() {
+        assert_eq!(
+            dfscalar_to_json(&DfScalar::Decimal128(Some(-12345), 5, 2)),
+            serde_json::json!(-123.45)
+        );
+        // scale=0 keeps the integer value as a JSON number; ryu may emit "123.0"
+        // (which decimal? still parses fine on the C# side).
+        assert_eq!(
+            dfscalar_to_json(&DfScalar::Decimal128(Some(123), 3, 0)),
+            serde_json::json!(123.0)
         );
     }
 
