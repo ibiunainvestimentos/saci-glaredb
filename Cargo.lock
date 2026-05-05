@@ -6269,6 +6269,7 @@ dependencies = [
  "num-traits",
  "once_cell",
  "repr",
+ "serde_json",
  "thiserror",
  "tokio-postgres",
  "tracing",
