@@ -266,7 +266,12 @@ impl SessionVarsInner {
             Err(VarError::UnknownVariable(name.to_string()).into())
         }
     }
-    pub(super) fn entries(&self) -> Vec<ConfigEntry> {
+    /// Returns one ConfigEntry per session variable. Used by
+    /// `glare_catalog.session_vars` (consumed by the `pg_settings` view)
+    /// to surface live session-var inventory to JDBC / DBeaver / pgcli /
+    /// `SHOW ALL`. `pub` (was `pub(super)`) so the dispatcher in sqlexec
+    /// can populate the BuiltinTable.
+    pub fn entries(&self) -> Vec<ConfigEntry> {
         vec![
             self.server_version.config_entry(),
             self.server_version_num.config_entry(),

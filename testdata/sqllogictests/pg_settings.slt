@@ -1,0 +1,36 @@
+# `pg_catalog.pg_settings` populated from `glare_catalog.session_vars`.
+# Real PG ships ~300 rows; ours surfaces the ~30 SessionVars defined in
+# `datafusion_ext/vars/inner.rs`. Was empty (NULL stub) before this fix.
+
+# At least core vars must be present.
+query T rowsort
+SELECT name FROM pg_catalog.pg_settings
+WHERE name IN ('server_version', 'TimeZone', 'search_path',
+               'DateStyle', 'is_superuser', 'session_authorization');
+----
+DateStyle
+TimeZone
+is_superuser
+search_path
+server_version
+session_authorization
+
+# Spot-check value: server_version matches the spoofed PG version.
+query T
+SELECT setting FROM pg_catalog.pg_settings WHERE name = 'server_version';
+----
+15.1
+
+# Total row count is non-zero (was 0 before — empty NULL-stub view).
+query B
+SELECT COUNT(*) > 10 FROM pg_catalog.pg_settings;
+----
+true
+
+# Schema sanity: every required column is present and queryable.
+query T
+SELECT name FROM pg_catalog.pg_settings
+WHERE setting IS NOT NULL AND vartype = 'string'
+LIMIT 1;
+----
+server_version

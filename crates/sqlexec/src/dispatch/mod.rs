@@ -198,9 +198,24 @@ impl<'a> Dispatcher<'a> {
 
         // Builtin tables
         if tbl.meta.builtin {
-            return SystemTableDispatcher::new(self.catalog, self.tables, self.function_registry)
-                .dispatch(tbl)
-                .await;
+            // Extract SessionVars (Arc-RwLock under the hood, cheap clone)
+            // for the SystemTableDispatcher — it needs them to populate
+            // `glare_catalog.session_vars` and downstream `pg_settings`.
+            let cfg = self.df_ctx.copied_config();
+            let session_vars = cfg
+                .options()
+                .extensions
+                .get::<datafusion_ext::vars::SessionVars>()
+                .cloned()
+                .unwrap_or_default();
+            return SystemTableDispatcher::new(
+                self.catalog,
+                self.tables,
+                self.function_registry,
+                &session_vars,
+            )
+            .dispatch(tbl)
+            .await;
         }
 
         // External tables

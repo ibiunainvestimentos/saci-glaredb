@@ -1,0 +1,26 @@
+# `pg_catalog.pg_database` must contain a row for the
+# connection-time database name returned by `current_database()`.
+# Previously the view enumerated only `glare_catalog.databases` (which
+# only has the builtin 'default' plus `CREATE EXTERNAL DATABASE` rows),
+# so a query for the actual connected database returned 0 rows.
+
+# The connection database is always present in pg_database.
+query B
+SELECT pg_catalog.current_database() IN
+       (SELECT datname FROM pg_catalog.pg_database);
+----
+true
+
+# Filter by current_database() — must return exactly one row.
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_database
+WHERE datname = pg_catalog.current_database();
+----
+1
+
+# Required pg_database columns are populated for the synthetic row.
+query TII
+SELECT datname, datdba, encoding FROM pg_catalog.pg_database
+WHERE datname = pg_catalog.current_database();
+----
+default 10 6

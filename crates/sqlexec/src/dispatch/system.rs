@@ -1,10 +1,17 @@
 use std::sync::Arc;
 
 use catalog::session_catalog::SessionCatalog;
-use datafusion::arrow::array::{BooleanBuilder, ListBuilder, StringBuilder, UInt32Builder};
+use datafusion::arrow::array::{
+    BooleanBuilder,
+    Float64Builder,
+    ListBuilder,
+    StringBuilder,
+    UInt32Builder,
+};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::logical_expr::TypeSignature;
+use datafusion_ext::vars::SessionVars;
 use datasources::common::ssh::key::SshKey;
 use datasources::common::ssh::SshConnectionParameters;
 use datasources::native::access::NativeTableStorage;
@@ -22,6 +29,7 @@ use sqlbuiltins::builtins::{
     GLARE_FUNCTIONS,
     GLARE_INDEXES,
     GLARE_SCHEMAS,
+    GLARE_SESSION_VARS,
     GLARE_SSH_KEYS,
     GLARE_TABLES,
     GLARE_TUNNELS,
@@ -37,6 +45,7 @@ pub struct SystemTableDispatcher<'a> {
     catalog: &'a SessionCatalog,
     tables: &'a NativeTableStorage,
     function_registry: &'a FunctionRegistry,
+    session_vars: &'a SessionVars,
 }
 
 impl<'a> SystemTableDispatcher<'a> {
@@ -44,11 +53,13 @@ impl<'a> SystemTableDispatcher<'a> {
         catalog: &'a SessionCatalog,
         tables: &'a NativeTableStorage,
         function_registry: &'a FunctionRegistry,
+        session_vars: &'a SessionVars,
     ) -> Self {
         SystemTableDispatcher {
             catalog,
             tables,
             function_registry,
+            session_vars,
         }
     }
 
@@ -66,7 +77,9 @@ impl<'a> SystemTableDispatcher<'a> {
         } else if GLARE_CREDENTIALS.matches(schema, name) {
             Arc::new(self.build_glare_credentials())
         } else if GLARE_TABLES.matches(schema, name) {
-            Arc::new(self.build_glare_tables())
+            Arc::new(self.build_glare_tables().await)
+        } else if GLARE_SESSION_VARS.matches(schema, name) {
+            Arc::new(self.build_glare_session_vars())
         } else if GLARE_COLUMNS.matches(schema, name) {
             Arc::new(self.build_glare_columns())
         } else if GLARE_VIEWS.matches(schema, name) {
@@ -298,7 +311,7 @@ impl<'a> SystemTableDispatcher<'a> {
         MemTable::try_new(arrow_schema, vec![vec![batch]]).unwrap()
     }
 
-    fn build_glare_tables(&self) -> MemTable {
+    async fn build_glare_tables(&self) -> MemTable {
         let arrow_schema = Arc::new(GLARE_TABLES.arrow_schema());
 
         let mut oid = UInt32Builder::new();
@@ -311,6 +324,7 @@ impl<'a> SystemTableDispatcher<'a> {
         let mut datasource = StringBuilder::new();
         let mut access_mode = StringBuilder::new();
         let mut comment = StringBuilder::new();
+        let mut reltuples = Float64Builder::new();
 
         for table in self
             .catalog
@@ -332,8 +346,10 @@ impl<'a> SystemTableDispatcher<'a> {
                     .unwrap_or("<invalid>"),
             );
             table_name.append_value(&table.entry.get_meta().name);
-            builtin.append_value(table.builtin);
-            external.append_value(table.entry.get_meta().external);
+            let table_is_builtin = table.builtin;
+            let table_is_external = table.entry.get_meta().external;
+            builtin.append_value(table_is_builtin);
+            external.append_value(table_is_external);
             comment.append_option(table.entry.get_meta().comment.as_deref());
 
             let table = match table.entry {
@@ -343,6 +359,25 @@ impl<'a> SystemTableDispatcher<'a> {
 
             datasource.append_value(table.options.as_str());
             access_mode.append_value(table.access_mode.as_str());
+
+            // reltuples: only native (non-builtin, non-external) Delta
+            // tables have stats accessible via NativeTableStorage. Look
+            // up cheaply via Delta `_last_checkpoint`; NULL on any
+            // failure (cold cache, transient I/O, never-loaded).
+            // `load_table` returns Result; `statistics()` returns
+            // Option; `num_rows.get_value()` returns Option<&usize>.
+            let n = if table_is_builtin || table_is_external {
+                None
+            } else {
+                self.tables
+                    .load_table(table)
+                    .await
+                    .ok()
+                    .and_then(|nt| nt.statistics())
+                    .and_then(|stats| stats.num_rows.get_value().copied())
+                    .map(|n| n as f64)
+            };
+            reltuples.append_option(n);
         }
 
         // Append temporary tables.
@@ -358,6 +393,7 @@ impl<'a> SystemTableDispatcher<'a> {
             datasource.append_value(table.options.as_str());
             access_mode.append_value(SourceAccessMode::ReadWrite.as_str());
             comment.append_option(table.meta.comment.as_deref());
+            reltuples.append_null(); // temp tables: no Delta stats
         }
 
         let batch = RecordBatch::try_new(
@@ -373,6 +409,36 @@ impl<'a> SystemTableDispatcher<'a> {
                 Arc::new(datasource.finish()),
                 Arc::new(access_mode.finish()),
                 Arc::new(comment.finish()),
+                Arc::new(reltuples.finish()),
+            ],
+        )
+        .unwrap();
+
+        MemTable::try_new(arrow_schema, vec![vec![batch]]).unwrap()
+    }
+
+    /// Populate `glare_catalog.session_vars` from the current
+    /// `SessionVars`. Backs `pg_catalog.pg_settings` so JDBC / DBeaver /
+    /// `SHOW ALL` all return non-empty.
+    fn build_glare_session_vars(&self) -> MemTable {
+        let arrow_schema = Arc::new(GLARE_SESSION_VARS.arrow_schema());
+
+        let mut name = StringBuilder::new();
+        let mut setting = StringBuilder::new();
+        let mut short_desc = StringBuilder::new();
+
+        for entry in self.session_vars.read().entries() {
+            name.append_value(&entry.key);
+            setting.append_option(entry.value.as_deref());
+            short_desc.append_value(entry.description);
+        }
+
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(name.finish()),
+                Arc::new(setting.finish()),
+                Arc::new(short_desc.finish()),
             ],
         )
         .unwrap();

@@ -159,6 +159,11 @@ pub static GLARE_TABLES: Lazy<BuiltinTable> = Lazy::new(|| BuiltinTable {
         // User comment (`COMMENT ON TABLE`). Surfaces as
         // `pg_description.description`.
         ("comment", DataType::Utf8, true),
+        // Approximate row count from Delta statistics. Populated by
+        // `build_glare_tables` for native (writeable Delta) tables;
+        // NULL for builtin / external / temp / never-loaded tables.
+        // Surfaced as `pg_class.reltuples`.
+        ("reltuples", DataType::Float64, true),
     ]),
     oid: 16405,
 });
@@ -340,6 +345,22 @@ pub static GLARE_CONSTRAINTS: Lazy<BuiltinTable> = Lazy::new(|| BuiltinTable {
     oid: 16413,
 });
 
+/// Per-session variable inventory. Populated at dispatch time from
+/// `SessionVarsInner::entries()` in datafusion_ext. Backs
+/// `pg_catalog.pg_settings`, which downstream tools (DBeaver,
+/// `SHOW ALL`, JDBC's `VariableInfo`) rely on for runtime
+/// configuration introspection.
+pub static GLARE_SESSION_VARS: Lazy<BuiltinTable> = Lazy::new(|| BuiltinTable {
+    schema: INTERNAL_SCHEMA,
+    name: "session_vars",
+    columns: InternalColumnDefinition::from_tuples([
+        ("name", DataType::Utf8, false),
+        ("setting", DataType::Utf8, true),
+        ("short_desc", DataType::Utf8, true),
+    ]),
+    oid: 16414,
+});
+
 impl BuiltinTable {
     /// Check if this table matches the provided schema and name.
     pub fn matches(&self, schema: &str, name: &str) -> bool {
@@ -372,6 +393,7 @@ impl BuiltinTable {
             &GLARE_CACHED_EXTERNAL_DATABASE_TABLES,
             &GLARE_INDEXES,
             &GLARE_CONSTRAINTS,
+            &GLARE_SESSION_VARS,
         ]
     }
 }
@@ -662,7 +684,7 @@ SELECT
     CAST(0 AS INT)                                           AS relfilenode,
     CAST(0 AS INT)                                           AS reltablespace,
     CAST(0 AS INT)                                           AS relpages,
-    CAST(0.0 AS REAL)                                        AS reltuples,
+    CAST(COALESCE(t.reltuples, 0.0) AS REAL)                 AS reltuples,
     CAST(0 AS INT)                                           AS relallvisible,
     CAST(0 AS INT)                                           AS reltoastrelid,
     false                                                    AS relhasindex,
@@ -778,6 +800,14 @@ FROM (VALUES (1)) WHERE false",
 pub static PG_DATABASE: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     schema: POSTGRES_SCHEMA,
     name: "pg_database",
+    // First arm enumerates `glare_catalog.databases` (the builtin
+    // 'default' database plus any `CREATE EXTERNAL DATABASE` rows).
+    // Second arm synthesizes a row for the connection-time database
+    // name returned by `current_database()` so that
+    // `SELECT * FROM pg_database WHERE datname = current_database()`
+    // is non-empty — JDBC, asyncpg's introspection, and DBeaver's
+    // navigator all rely on this. The `WHERE … NOT IN` predicate
+    // dedupes when current_database() = 'default'.
     sql: "
 SELECT
     oid                              AS oid,
@@ -796,7 +826,27 @@ SELECT
     CAST(NULL AS TEXT)               AS daticulocal,
     CAST(NULL AS TEXT)               AS datcollversion,
     CAST(NULL AS TEXT)               AS datacl
-FROM glare_catalog.databases",
+FROM glare_catalog.databases
+UNION ALL
+SELECT
+    CAST(0 AS INT)                   AS oid,
+    pg_catalog.current_database()    AS datname,
+    CAST(10 AS INT)                  AS datdba,
+    CAST(6 AS INT)                   AS encoding,
+    'c'                              AS datlocprovider,
+    false                            AS datistemplate,
+    true                             AS datallowconn,
+    CAST(-1 AS INT)                  AS datconnlimit,
+    CAST(0 AS BIGINT)                AS datfrozenxid,
+    CAST(0 AS BIGINT)                AS datminmxid,
+    CAST(1663 AS INT)                AS dattablespace,
+    'en_US.UTF-8'                    AS datcollate,
+    'en_US.UTF-8'                    AS datctype,
+    CAST(NULL AS TEXT)               AS daticulocal,
+    CAST(NULL AS TEXT)               AS datcollversion,
+    CAST(NULL AS TEXT)               AS datacl
+WHERE pg_catalog.current_database() NOT IN
+      (SELECT database_name FROM glare_catalog.databases)",
 });
 
 pub static PG_TABLES: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
@@ -936,7 +986,15 @@ SELECT
     CAST(NULL AS TEXT)                         AS proargtypes,
     CAST(NULL AS TEXT)                         AS proallargtypes,
     CAST(NULL AS TEXT)                         AS proargmodes,
-    f.parameters                               AS proargnames,
+    -- proargnames is a `text[]` in real Postgres. The source column
+    -- `f.parameters` is `List<Utf8>`, which the pgwire layer
+    -- serialises as a JSON literal (`[..]`) — wrong shape for asyncpg
+    -- / JDBC introspection. Format it as a PG-array text literal
+    -- (`{a,b,c}`) so the announced text type is what tools expect.
+    CASE
+        WHEN cardinality(f.parameters) = 0 THEN CAST('{}' AS TEXT)
+        ELSE '{' || array_to_string(f.parameters, ',') || '}'
+    END                                        AS proargnames,
     CAST(NULL AS TEXT)                         AS proargdefaults,
     CAST(NULL AS TEXT)                         AS protrftypes,
     COALESCE(f.example, '')                    AS prosrc,
@@ -1197,29 +1255,30 @@ SELECT * FROM (VALUES
 pub static PG_SETTINGS: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     schema: POSTGRES_SCHEMA,
     name: "pg_settings",
-    // Empty rowset for now — full enumeration of session vars lands when
-    // we wire `SessionVarsInner` to a TVF (W2-funcs / W3a). DBeaver only
-    // probes column shape at startup, so this satisfies its `SettingCache`.
+    // Backed by `glare_catalog.session_vars`, which the dispatcher
+    // populates from `SessionVarsInner::entries()` at request time.
+    // DBeaver / pgcli / `SHOW ALL` all read this; the prior empty-stub
+    // body left them blank.
     sql: "
 SELECT
-    CAST(NULL AS TEXT)     AS name,
-    CAST(NULL AS TEXT)     AS setting,
+    name                   AS name,
+    setting                AS setting,
     CAST(NULL AS TEXT)     AS unit,
     CAST(NULL AS TEXT)     AS category,
-    CAST(NULL AS TEXT)     AS short_desc,
+    short_desc             AS short_desc,
     CAST(NULL AS TEXT)     AS extra_desc,
-    CAST(NULL AS TEXT)     AS context,
-    CAST(NULL AS TEXT)     AS vartype,
-    CAST(NULL AS TEXT)     AS source,
+    'user'                 AS context,
+    'string'               AS vartype,
+    'session'              AS source,
     CAST(NULL AS TEXT)     AS min_val,
     CAST(NULL AS TEXT)     AS max_val,
     CAST(NULL AS TEXT)     AS enumvals,
-    CAST(NULL AS TEXT)     AS boot_val,
-    CAST(NULL AS TEXT)     AS reset_val,
+    setting                AS boot_val,
+    setting                AS reset_val,
     CAST(NULL AS TEXT)     AS sourcefile,
     CAST(NULL AS INT)      AS sourceline,
-    CAST(NULL AS BOOLEAN)  AS pending_restart
-FROM (VALUES (1)) WHERE false",
+    false                  AS pending_restart
+FROM glare_catalog.session_vars",
 });
 
 pub static PG_EXTENSION: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {

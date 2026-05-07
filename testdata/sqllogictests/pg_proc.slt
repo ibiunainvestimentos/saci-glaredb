@@ -1,0 +1,34 @@
+# `pg_catalog.pg_proc.proargnames` must be a PG-array text literal
+# (`{a,b,c}`) — NOT a JSON array (`[..]`) which the prior body emitted
+# via the `List<Utf8>`-as-JSON pgwire path.
+
+# Functions with no parameters render as the empty PG-array literal.
+query T
+SELECT proargnames FROM pg_catalog.pg_proc
+WHERE proname = 'current_database'
+LIMIT 1;
+----
+{}
+
+# Functions with at least one parameter render as `{name1,name2,...}`.
+# pg_type_oid_by_name takes one argument named "Utf8" (the Arrow type
+# name); proargnames should be the literal `{Utf8}`.
+query T
+SELECT proargnames FROM pg_catalog.pg_proc
+WHERE proname = 'pg_type_oid_by_name'
+LIMIT 1;
+----
+{Utf8}
+
+# pg_proc has a non-zero count (sanity).
+query B
+SELECT COUNT(*) > 100 FROM pg_catalog.pg_proc;
+----
+true
+
+# Aggregates filter via prokind = 'a' (used by sacibackend's
+# list_functions(category='aggregate') MCP tool).
+query B
+SELECT COUNT(*) > 10 FROM pg_catalog.pg_proc WHERE prokind = 'a';
+----
+true
