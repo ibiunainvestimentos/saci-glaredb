@@ -23,6 +23,7 @@ use crate::auth::{LocalAuthenticator, PasswordMode};
 use crate::codec::server::{FramedConn, PgCodec};
 use crate::errors::{PgSrvError, Result};
 use crate::messages::{
+    classify_sqlstate,
     BackendMessage,
     DescribeObjectType,
     ErrorResponse,
@@ -582,6 +583,17 @@ where
 
     /// Send an error response to the client.
     async fn send_error(&mut self, err: ErrorResponse) -> Result<()> {
+        // Auto-transition tx_status to Failed when an error fires inside
+        // an active transaction block. Real Postgres behaviour: any
+        // server-side error during BEGIN..COMMIT moves the tx into
+        // failed state, surfaced via the `Z` byte ('E') and enforced by
+        // the 25P02 gate at the top of `query()` / `execute()`. Doing
+        // it here covers every error path uniformly (Parse, Bind,
+        // Execute, send_error from gates) without requiring each
+        // handler to remember the transition.
+        if matches!(self.tx_status, TransactionStatus::InBlock) {
+            self.tx_status = TransactionStatus::Failed;
+        }
         self.conn.send(err.into()).await?;
         Ok(())
     }
@@ -1078,12 +1090,14 @@ where
             let batch = match result {
                 Ok(r) => r,
                 Err(e) => {
+                    // Errors that surface mid-stream (e.g. Arrow Cast
+                    // errors during execution) flow through here. Pass
+                    // through classify_sqlstate so cast / not-supported /
+                    // and similar wordings get the right code instead of
+                    // the catch-all XX000 InternalError.
+                    let msg = e.to_string();
                     conn.send(
-                        ErrorResponse::error(
-                            pgrepr::notice::SqlState::InternalError,
-                            e.to_string(),
-                        )
-                        .into(),
+                        ErrorResponse::error(classify_sqlstate(&msg), msg).into(),
                     )
                     .await?;
                     return Ok(None);

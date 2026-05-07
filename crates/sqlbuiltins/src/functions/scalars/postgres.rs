@@ -442,6 +442,12 @@ impl BuiltinScalarUDF for CurrentDatabase {
     fn try_as_expr(&self, _: &SessionCatalog, _: Vec<Expr>) -> DataFusionResult<Expr> {
         Ok(session_var("current_database"))
     }
+    fn namespace(&self) -> FunctionNamespace {
+        // Real Postgres exposes this in `pg_catalog`. Make it dual-callable
+        // so DBeaver / asyncpg introspection that prefix as
+        // `pg_catalog.current_database()` succeed alongside bare calls.
+        PG_CATALOG_NAMESPACE
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -830,7 +830,7 @@ FROM glare_catalog.databases
 UNION ALL
 SELECT
     CAST(0 AS INT)                   AS oid,
-    pg_catalog.current_database()    AS datname,
+    current_database()               AS datname,
     CAST(10 AS INT)                  AS datdba,
     CAST(6 AS INT)                   AS encoding,
     'c'                              AS datlocprovider,
@@ -845,7 +845,7 @@ SELECT
     CAST(NULL AS TEXT)               AS daticulocal,
     CAST(NULL AS TEXT)               AS datcollversion,
     CAST(NULL AS TEXT)               AS datacl
-WHERE pg_catalog.current_database() NOT IN
+WHERE current_database() NOT IN
       (SELECT database_name FROM glare_catalog.databases)",
 });
 

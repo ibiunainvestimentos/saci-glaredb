@@ -289,6 +289,21 @@ impl LocalSessionContext {
             .map_err(ExecError::from)
     }
 
+    /// Force-fetch the latest catalog state from the metastore worker
+    /// (bypasses the `force_catalog_refresh` session-var gate). Used by
+    /// the post-DDL hook in `Session::execute_inner` so the SAME
+    /// session sees its own writes — the default `maybe_refresh_state`
+    /// path races the metastore worker's `version_hint` AtomicU64
+    /// store and may no-op even though the metastore has the latest.
+    pub async fn force_refresh_state(&mut self) -> Result<()> {
+        let mutator = self.catalog_mutator();
+        let client = mutator.get_metastore_client();
+        self.catalog
+            .maybe_refresh_state(client, /* force_refresh = */ true)
+            .await
+            .map_err(ExecError::from)
+    }
+
     /// Create a prepared statement.
     pub async fn prepare_statement(
         &mut self,

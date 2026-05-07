@@ -255,7 +255,7 @@ impl From<PgReprError> for ErrorResponse {
 ///
 /// The matcher errs on the side of preserving `InternalError` when no
 /// signal is present — a wrong specific code is worse than a generic one.
-fn classify_sqlstate(msg: &str) -> pgrepr::notice::SqlState {
+pub(crate) fn classify_sqlstate(msg: &str) -> pgrepr::notice::SqlState {
     use pgrepr::notice::SqlState;
     let lower = msg.to_ascii_lowercase();
 

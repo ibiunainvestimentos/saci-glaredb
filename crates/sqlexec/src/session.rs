@@ -669,7 +669,10 @@ impl Session {
                             .get_session_catalog_mut()
                             .swap_state(Arc::new(state));
                     } else {
-                        self.ctx.maybe_refresh_state().await?;
+                        // Local session: force-fetch (don't rely on
+                        // version_hint comparison — that races the
+                        // metastore worker's AtomicU64 Relaxed store).
+                        self.ctx.force_refresh_state().await?;
                     }
                 }
 
