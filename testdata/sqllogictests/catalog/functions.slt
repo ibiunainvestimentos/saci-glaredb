@@ -27,7 +27,11 @@ where function_name = 'repeat';
 ----
 repeat   scalar   []   t   repeat('hello', 2)   Repeat a string a specified number of times
 
-# Assert an arbitrary datafusion aggregate function exists.
+# Assert an arbitrary datafusion aggregate function exists. The list column
+# renders as a JSON array (`["…"]`) because nested Arrow types are
+# serialised as JSON over the pgwire — see the
+# `[FEAT] pgrepr: serialise nested Arrow types as JSON over the pgwire`
+# commit and `pgrepr::scalar::dfscalar_to_json`.
 query TTTTTT
 select
     function_name,
@@ -39,7 +43,7 @@ select
 from glare_catalog.functions
 where function_name = 'sum';
 ----
-sum   aggregate   [Int8/Int16/Int32/Int64/UInt8/UInt16/UInt32/UInt64/Float32/Float64]   t   sum(a)   Returns the sum of a column
+sum aggregate ["Int8/Int16/Int32/Int64/UInt8/UInt16/UInt32/UInt64/Float32/Float64"] t sum(a) Returns the sum of a column
 
 # Assert an arbitrary glaredb table function exists.
 query TTTTTT
@@ -53,7 +57,7 @@ select
 from glare_catalog.functions
 where function_name = 'read_parquet';
 ----
-read_parquet   table   [Utf8, Utf8, , List<Utf8>, List<Utf8>, ]   t   SELECT * FROM read_parquet('./my_data.parquet')   Returns a table by scanning the given Parquet file(s).
+read_parquet table ["Utf8","Utf8, ","List<Utf8>","List<Utf8>, "] t SELECT * FROM read_parquet('./my_data.parquet') Returns a table by scanning the given Parquet file(s).
 
 # Assert an arbitrary glaredb table function exists (using an alias).
 query TTTTTT
@@ -67,7 +71,7 @@ select
 from glare_catalog.functions
 where function_name = 'parquet_scan';
 ----
-parquet_scan   table   [Utf8, Utf8, , List<Utf8>, List<Utf8>, ]   t   SELECT * FROM read_parquet('./my_data.parquet')   Returns a table by scanning the given Parquet file(s).
+parquet_scan table ["Utf8","Utf8, ","List<Utf8>","List<Utf8>, "] t SELECT * FROM read_parquet('./my_data.parquet') Returns a table by scanning the given Parquet file(s).
 
 # 'array_to_string' is a tricky one since we're aliasing 'array_to_string' to
 # 'pg_catalog.array_to_string'. A more correct implementation would return two

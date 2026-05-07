@@ -127,6 +127,210 @@ select * from pg_rewrite;
 statement ok
 select * from pg_depend;
 
+# DBeaver compatibility — every view DBeaver probes at connect / tree-expand
+# must be selectable both as `pg_catalog.X` and as a bare name (relies on
+# the implicit `pg_catalog` entry in the search path).
+
+# Newly added pg_catalog views (qualified)
+statement ok
+select * from pg_catalog.pg_proc;
+
+statement ok
+select * from pg_catalog.pg_aggregate;
+
+statement ok
+select * from pg_catalog.pg_attrdef;
+
+statement ok
+select * from pg_catalog.pg_index;
+
+statement ok
+select * from pg_catalog.pg_constraint;
+
+statement ok
+select * from pg_catalog.pg_inherits;
+
+statement ok
+select * from pg_catalog.pg_roles;
+
+statement ok
+select * from pg_catalog.pg_authid;
+
+statement ok
+select * from pg_catalog.pg_collation;
+
+statement ok
+select * from pg_catalog.pg_language;
+
+statement ok
+select * from pg_catalog.pg_tablespace;
+
+statement ok
+select * from pg_catalog.pg_settings;
+
+statement ok
+select * from pg_catalog.pg_extension;
+
+statement ok
+select * from pg_catalog.pg_available_extensions;
+
+statement ok
+select * from pg_catalog.pg_event_trigger;
+
+statement ok
+select * from pg_catalog.pg_default_acl;
+
+statement ok
+select * from pg_catalog.pg_foreign_data_wrapper;
+
+statement ok
+select * from pg_catalog.pg_foreign_server;
+
+statement ok
+select * from pg_catalog.pg_conversion;
+
+statement ok
+select * from pg_catalog.pg_enum;
+
+statement ok
+select * from pg_catalog.pg_trigger;
+
+statement ok
+select * from pg_catalog.pg_shdescription;
+
+statement ok
+select * from pg_catalog.pg_replication_slots;
+
+statement ok
+select * from pg_catalog.pg_publication;
+
+statement ok
+select * from pg_catalog.pg_subscription;
+
+# Same views, accessed unqualified through the implicit search path.
+statement ok
+select * from pg_proc;
+
+statement ok
+select * from pg_aggregate;
+
+statement ok
+select * from pg_constraint;
+
+statement ok
+select * from pg_index;
+
+statement ok
+select * from pg_roles;
+
+statement ok
+select * from pg_collation;
+
+statement ok
+select * from pg_language;
+
+statement ok
+select * from pg_tablespace;
+
+statement ok
+select * from pg_settings;
+
+statement ok
+select * from pg_attrdef;
+
+statement ok
+select * from pg_inherits;
+
+statement ok
+select * from pg_authid;
+
+# Sanity checks for content of the views that *do* return rows.
+
+# pg_am must contain the classic access methods so DBeaver's tree shows
+# btree / hash / gin / gist / brin under "Access Methods".
+query TT
+select amname, amtype from pg_catalog.pg_am order by amname;
+----
+brin   i
+btree  i
+gin    i
+gist   i
+hash   i
+
+# pg_collation should have the three baseline rows (default + C + POSIX).
+query T
+select collname from pg_catalog.pg_collation order by collname;
+----
+C
+POSIX
+default
+
+# pg_language must include sql / internal / c.
+query T
+select lanname from pg_catalog.pg_language order by lanname;
+----
+c
+internal
+sql
+
+# pg_tablespace must carry pg_default + pg_global.
+query T
+select spcname from pg_catalog.pg_tablespace order by spcname;
+----
+pg_default
+pg_global
+
+# Single hard-coded role exposed by pg_roles / pg_authid.
+query T
+select rolname from pg_catalog.pg_roles;
+----
+glaredb
+
+# pg_type must expose a sensible subset of upstream OIDs. The exact list
+# can grow but must always cover the well-known scalar OIDs DBeaver / drivers
+# look up by id.
+query IT
+select oid, typname
+from pg_catalog.pg_type
+where oid in (16, 23, 25, 1700, 114, 3802, 2950)
+order by oid;
+----
+16    bool
+23    int4
+25    text
+114   json
+1700  numeric
+2950  uuid
+3802  jsonb
+
+# DBeaver's per-result-column metadata fetch — a five-table join over
+# pg_class + pg_namespace + pg_attribute + pg_type + pg_attrdef. Must at
+# least parse and produce a row when join targets exist. We use `LIMIT 0`
+# rather than a value-based predicate to dodge predicate-pushdown rewrites
+# that try to cast negative literals into the UInt32 `column_ordinal`
+# column underlying `attnum`.
+statement ok
+SELECT c.oid, a.attnum, a.attname, c.relname, n.nspname,
+       a.attnotnull,
+       a.attidentity
+FROM pg_catalog.pg_class c
+  JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+  JOIN pg_catalog.pg_attribute a ON c.oid = a.attrelid
+  JOIN pg_catalog.pg_type t ON a.atttypid = t.oid
+  LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+LIMIT 0;
+
+# DBeaver's column-tree query (TableCache.children) — heavy join with a
+# full column projection. Make sure each referenced column exists.
+statement ok
+SELECT c.relname, a.*, dsc.description
+FROM pg_catalog.pg_attribute a
+INNER JOIN pg_catalog.pg_class c ON a.attrelid = c.oid
+LEFT OUTER JOIN pg_catalog.pg_attrdef ad ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
+LEFT OUTER JOIN pg_catalog.pg_description dsc ON c.oid = dsc.objoid AND a.attnum = dsc.objsubid
+WHERE NOT a.attisdropped AND c.relkind NOT IN ('i', 'I', 'c')
+ORDER BY a.attnum;
+
 # https://github.com/GlareDB/glaredb/issues/2475
 statement ok
 WITH table_privileges AS (

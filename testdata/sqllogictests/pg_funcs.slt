@@ -1,0 +1,179 @@
+# Postgres `pg_get_*` / visibility / sizing / introspection UDFs.
+#
+# Most of these are stubs (empty string / NULL / 0 / t) — the value isn't
+# important, the *signature* is. DBeaver, ibis, dbt, JDBC etc. probe these
+# functions at startup and tree-expand time and silently disable features when
+# they're missing.
+
+# pg_get_expr(adbin, adrelid [, pretty]) — identity on first arg.
+query T
+SELECT pg_get_expr('foo', 0::bigint);
+----
+foo
+
+query T
+SELECT pg_get_expr('bar baz', 0::bigint, true);
+----
+bar baz
+
+# pg_get_viewdef(oid) — empty stub.
+query T
+SELECT pg_get_viewdef(0::bigint);
+----
+(empty)
+
+query T
+SELECT pg_get_viewdef(0::bigint, true);
+----
+(empty)
+
+# pg_get_indexdef / pg_get_constraintdef / pg_get_triggerdef — empty stubs.
+query T
+SELECT pg_get_indexdef(0::bigint);
+----
+(empty)
+
+query T
+SELECT pg_get_indexdef(0::bigint, 0::int, true);
+----
+(empty)
+
+query T
+SELECT pg_get_constraintdef(0::bigint);
+----
+(empty)
+
+query T
+SELECT pg_get_constraintdef(0::bigint, true);
+----
+(empty)
+
+query T
+SELECT pg_get_triggerdef(0::bigint);
+----
+(empty)
+
+query T
+SELECT pg_get_functiondef(0::bigint);
+----
+(empty)
+
+query T
+SELECT pg_get_function_arguments(0::bigint);
+----
+(empty)
+
+query T
+SELECT pg_get_function_identity_arguments(0::bigint);
+----
+(empty)
+
+query T
+SELECT pg_get_function_result(0::bigint);
+----
+(empty)
+
+# pg_get_partkeydef → NULL.
+query T
+SELECT pg_get_partkeydef(0::bigint) IS NULL;
+----
+t
+
+# Visibility helpers — every object is reachable.
+query T
+SELECT pg_function_is_visible(0::bigint);
+----
+t
+
+query T
+SELECT pg_type_is_visible(0::bigint);
+----
+t
+
+query T
+SELECT pg_opclass_is_visible(0::bigint);
+----
+t
+
+query T
+SELECT pg_collation_is_visible(0::bigint);
+----
+t
+
+query T
+SELECT pg_conversion_is_visible(0::bigint);
+----
+t
+
+# Sizing — everything is 0.
+query I
+SELECT pg_relation_size(0::bigint);
+----
+0
+
+query I
+SELECT pg_total_relation_size(0::bigint);
+----
+0
+
+query I
+SELECT pg_database_size(0::bigint);
+----
+0
+
+query I
+SELECT pg_table_size(0::bigint);
+----
+0
+
+query I
+SELECT pg_indexes_size(0::bigint);
+----
+0
+
+# Comment helpers — NULL stub until COMMENT ON storage lands.
+query T
+SELECT obj_description(0::bigint, 'pg_class') IS NULL;
+----
+t
+
+query T
+SELECT col_description(0::bigint, 1::int) IS NULL;
+----
+t
+
+query T
+SELECT shobj_description(0::bigint, 'pg_database') IS NULL;
+----
+t
+
+# has_*_privilege — always t.
+query T
+SELECT has_table_privilege('foo', 'SELECT');
+----
+t
+
+query T
+SELECT has_column_privilege('user', 'tab', 'col', 'SELECT');
+----
+t
+
+# Connection metadata.
+query T
+SELECT pg_is_in_recovery();
+----
+f
+
+query I
+SELECT pg_backend_pid();
+----
+0
+
+statement ok
+SELECT pg_postmaster_start_time();
+
+# pg_tablespace_location — empty.
+query T
+SELECT pg_tablespace_location(1663::bigint);
+----
+(empty)

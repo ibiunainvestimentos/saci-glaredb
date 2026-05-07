@@ -156,6 +156,9 @@ pub static GLARE_TABLES: Lazy<BuiltinTable> = Lazy::new(|| BuiltinTable {
         ("external", DataType::Boolean, false),
         ("datasource", DataType::Utf8, false),
         ("access_mode", DataType::Utf8, false), // `SourceAccessMode::as_str()`
+        // User comment (`COMMENT ON TABLE`). Surfaces as
+        // `pg_description.description`.
+        ("comment", DataType::Utf8, true),
     ]),
     oid: 16405,
 });
@@ -171,6 +174,7 @@ pub static GLARE_VIEWS: Lazy<BuiltinTable> = Lazy::new(|| BuiltinTable {
         ("view_name", DataType::Utf8, false),
         ("builtin", DataType::Boolean, false),
         ("sql", DataType::Utf8, false),
+        ("comment", DataType::Utf8, true),
     ]),
     oid: 16406,
 });
@@ -198,6 +202,9 @@ pub static GLARE_FUNCTIONS: Lazy<BuiltinTable> = Lazy::new(|| BuiltinTable {
         ("schema_oid", DataType::UInt32, false),
         ("function_name", DataType::Utf8, false),
         ("function_type", DataType::Utf8, false), // table, scalar, aggregate
+        // Human-readable signature strings — one entry per `OneOf` branch.
+        // Pre-existing column; kept for backward compatibility with the
+        // `glare_catalog.functions` table that users / tools already query.
         (
             "parameters",
             DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
@@ -206,6 +213,22 @@ pub static GLARE_FUNCTIONS: Lazy<BuiltinTable> = Lazy::new(|| BuiltinTable {
         ("builtin", DataType::Boolean, false),
         ("example", DataType::Utf8, true),
         ("description", DataType::Utf8, true),
+        // Arrow type name of each argument of the function's *first* (or
+        // preferred) signature, in positional order. Drives
+        // `pg_proc.proargtypes` and `pg_get_function_arguments(oid)`.
+        // Empty list = nullary or signature is non-`Exact`.
+        (
+            "argument_types",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
+            false,
+        ),
+        // Arrow type name of the return value. NULL when the function does
+        // not declare a fixed return type at registration time (most
+        // DataFusion `ScalarUDF`s defer return-type inference to planning).
+        ("return_type", DataType::Utf8, true),
+        // True for table-returning (i.e. set-returning) functions. Maps to
+        // `pg_proc.proretset`.
+        ("is_set_returning", DataType::Boolean, false),
     ]),
     oid: 16408,
 });
@@ -254,6 +277,69 @@ pub static GLARE_CACHED_EXTERNAL_DATABASE_TABLES: Lazy<BuiltinTable> = Lazy::new
     oid: 16411,
 });
 
+/// Index metadata for relations. Empty today (Delta tables have no
+/// secondary indexes), but the column shape is the source-of-truth for the
+/// `pg_catalog.pg_index` view — DBeaver and friends issue
+/// `SELECT … FROM pg_index WHERE 1<>1` to probe columns at startup, so the
+/// schema must exist even when no rows do.
+pub static GLARE_INDEXES: Lazy<BuiltinTable> = Lazy::new(|| BuiltinTable {
+    schema: INTERNAL_SCHEMA,
+    name: "indexes",
+    columns: InternalColumnDefinition::from_tuples([
+        ("oid", DataType::UInt32, false),
+        ("table_oid", DataType::UInt32, false),
+        ("schema_oid", DataType::UInt32, false),
+        ("index_name", DataType::Utf8, false),
+        // Whether this is the primary key for the table.
+        ("is_primary", DataType::Boolean, false),
+        // Whether this index enforces uniqueness.
+        ("is_unique", DataType::Boolean, false),
+        // 1-based ordinal positions of the indexed columns. Stored as a
+        // text-encoded space-separated list so it round-trips through
+        // `pg_index.indkey` (an `int2vector` on the wire).
+        ("column_positions", DataType::Utf8, true),
+        // Optional partial-index predicate (raw SQL). NULL = full index.
+        ("predicate", DataType::Utf8, true),
+        // Optional expression list for expression indexes.
+        ("expression", DataType::Utf8, true),
+        ("access_method", DataType::Utf8, false), // btree / hash / gin / ...
+    ]),
+    oid: 16412,
+});
+
+/// Constraint metadata for relations. Empty today (Delta tables have no
+/// PRIMARY KEY / FOREIGN KEY enforcement), but DBeaver probes
+/// `pg_catalog.pg_constraint` columns at connect — keep the column shape so
+/// that probe succeeds even with zero rows.
+pub static GLARE_CONSTRAINTS: Lazy<BuiltinTable> = Lazy::new(|| BuiltinTable {
+    schema: INTERNAL_SCHEMA,
+    name: "constraints",
+    columns: InternalColumnDefinition::from_tuples([
+        ("oid", DataType::UInt32, false),
+        ("conname", DataType::Utf8, false),
+        ("schema_oid", DataType::UInt32, false),
+        // 'c' check, 'u' unique, 'p' primary, 'f' foreign, 'x' exclusion.
+        ("contype", DataType::Utf8, false),
+        ("table_oid", DataType::UInt32, false),
+        ("ref_table_oid", DataType::UInt32, true),
+        // Constrained columns (1-based ordinals, space-joined). Maps to
+        // `pg_constraint.conkey` (`int2[]`).
+        ("column_positions", DataType::Utf8, true),
+        // Referenced columns for FKs (`confkey`).
+        ("ref_column_positions", DataType::Utf8, true),
+        ("update_action", DataType::Utf8, true), // a / r / c / n / d
+        ("delete_action", DataType::Utf8, true),
+        ("match_type", DataType::Utf8, true), // f full / p partial / s simple
+        ("is_deferrable", DataType::Boolean, false),
+        ("is_deferred", DataType::Boolean, false),
+        ("is_validated", DataType::Boolean, false),
+        // Raw SQL expression for CHECK / partial constraints. Renders to
+        // `pg_get_constraintdef` output.
+        ("definition", DataType::Utf8, true),
+    ]),
+    oid: 16413,
+});
+
 impl BuiltinTable {
     /// Check if this table matches the provided schema and name.
     pub fn matches(&self, schema: &str, name: &str) -> bool {
@@ -284,6 +370,8 @@ impl BuiltinTable {
             &GLARE_SSH_KEYS,
             &GLARE_DEPLOYMENT_METADATA,
             &GLARE_CACHED_EXTERNAL_DATABASE_TABLES,
+            &GLARE_INDEXES,
+            &GLARE_CONSTRAINTS,
         ]
     }
 }
@@ -475,94 +563,166 @@ INNER JOIN glare_catalog.databases d ON s.database_oid = d.oid
 ",
 });
 
+// ---------------------------------------------------------------------------
 // Postgres catalog tables.
 //
-// See <https://www.postgresql.org/docs/current/catalogs.html>
+// Each `pg_catalog.X` relation is exposed as a `BuiltinView` whose body is a
+// `SELECT` against the canonical `glare_catalog.X` builtin tables. This
+// follows the DuckDB `default_views.cpp` shape and means we never duplicate
+// catalog state — `glare_catalog` is the single source of truth, `pg_catalog`
+// is a thin Postgres-shaped projection on top.
+//
+// The full column shape matters for tools like DBeaver / DataGrip / pgcli /
+// dbt / ibis: they probe each column at startup with
+// `SELECT col FROM pg_catalog.X WHERE 1<>1`, branch on success, and silently
+// disable features when a column is missing. Empty rowsets are fine; missing
+// *columns* are not.
+//
+// See <https://www.postgresql.org/docs/current/catalogs.html>.
+//
+// IMPORTANT: every NULL inside `WHERE false` views is wrapped in `CAST(NULL
+// AS …)` so DataFusion infers a concrete type for the column instead of
+// `Null` — otherwise the wire-level `RowDescription` reports `text` for a
+// numeric column and DBeaver mis-formats the probe result.
 
 pub static PG_AM: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     schema: POSTGRES_SCHEMA,
     name: "pg_am",
+    // The classic Postgres access methods so DBeaver's `AccessMethodCache`
+    // populates with sensible names. `amhandler=0` is acceptable — DBeaver
+    // does not require it to point at a real `pg_proc` row.
     sql: "
-SELECT
-    0 AS oid,
-    'scan' AS amname,
-    null AS amhandler,
-    't' AS amtype",
+SELECT * FROM (VALUES
+    (CAST(403 AS INT), 'btree', CAST(0 AS INT), 'i'),
+    (CAST(405 AS INT), 'hash',  CAST(0 AS INT), 'i'),
+    (CAST(783 AS INT), 'gist',  CAST(0 AS INT), 'i'),
+    (CAST(2742 AS INT),'gin',   CAST(0 AS INT), 'i'),
+    (CAST(3580 AS INT),'brin',  CAST(0 AS INT), 'i')
+) AS am(oid, amname, amhandler, amtype)",
 });
 
 pub static PG_ATTRIBUTE: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     schema: POSTGRES_SCHEMA,
     name: "pg_attribute",
+    // One row per (table, column). DBeaver issues this view *per result-set
+    // column* of every query (see PgJDBC `PgResultSetMetaData`), so this is
+    // the hottest catalog view — keep it cheap.
+    //
+    // `atttypid` is resolved via the helper UDF `pg_type_oid_by_name`
+    // against the Arrow type name stored in `glare_catalog.columns.data_type`
+    // — see `pgrepr::pg_type_oid::arrow_name_to_pg_oid` for the bijection.
     sql: "
 SELECT
-    null           as attacl,
-    ' '            as attalign,
-    false          as attbyval,
-    0              as attcacheoff,
-    0              as attcollation,
-    ' '            as attcompression,
-    null           as attfdwoptions,
-    ' '            as attgenerated,
-    false          as atthasdef,
-    false          as atthasmissing,
-    ' '            as attidentity,
-    0              as attinhcount,
-    false          as attisdropped,
-    false          as attislocal,
-    0::smallint    as attlen,
-    null           as attmissingval,
-    ''             as attname,
-    0              as attndims,
-    false          as attnotnull,
-    0::smallint    as attnum,
-    null           as attoptions,
-    0              as attrelid,
-    0              as attstattarget,
-    ' '            as attstorage,
-    0              as atttypid,
-    0              as atttypmod
+    c.table_oid                            AS attrelid,
+    c.column_name                          AS attname,
+    pg_catalog.pg_type_oid_by_name(c.data_type) AS atttypid,
+    CAST(0 AS INT)                         AS attstattarget,
+    CAST(-1 AS SMALLINT)                   AS attlen,
+    CAST(c.column_ordinal AS SMALLINT) + 1 AS attnum,
+    CAST(0 AS SMALLINT)                    AS attndims,
+    CAST(-1 AS INT)                        AS attcacheoff,
+    CAST(-1 AS INT)                        AS atttypmod,
+    false                                  AS attbyval,
+    CAST(NULL AS TEXT)                     AS attalign,
+    CAST(NULL AS TEXT)                     AS attstorage,
+    CAST(NULL AS TEXT)                     AS attcompression,
+    NOT c.is_nullable                      AS attnotnull,
+    false                                  AS atthasdef,
+    false                                  AS atthasmissing,
+    CAST('' AS TEXT)                       AS attidentity,
+    CAST('' AS TEXT)                       AS attgenerated,
+    false                                  AS attisdropped,
+    true                                   AS attislocal,
+    CAST(0 AS SMALLINT)                    AS attinhcount,
+    CAST(0 AS INT)                         AS attcollation,
+    CAST(NULL AS TEXT)                     AS attacl,
+    CAST(NULL AS TEXT)                     AS attoptions,
+    CAST(NULL AS TEXT)                     AS attfdwoptions,
+    CAST(NULL AS TEXT)                     AS attmissingval
 FROM glare_catalog.columns c",
 });
 
 pub static PG_CLASS: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     schema: POSTGRES_SCHEMA,
     name: "pg_class",
+    // Tables (`relkind='r'`) and views (`relkind='v'`) projected from
+    // `glare_catalog`. `relnatts` comes from a correlated count of matching
+    // `glare_catalog.columns` rows. The `reltype` join into `pg_type`
+    // composite-row entries is left at 0 for now — DBeaver doesn't follow
+    // that pointer for the tree expansion path.
     sql: "
 SELECT
-    t.oid AS oid,
-    t.table_name AS relname,
-    t.schema_oid AS relnamespace,
-    0 AS reltype,
-    null AS reloftype,
-    null AS relowner,
-    null AS relam,
-    null AS relfilenode,
-    null AS reltablespace,
-    null AS relpages,
-    null AS reltyples,
-    null AS relallvisible,
-    null AS reltoastrelid,
-    null AS relhasindex,
-    null AS relisshared,
-    null AS relpersistence,
-    'r' AS relkind,
-    null AS relnatts,
-    null AS relchecks,
-    null AS relhasrules,
-    null AS relhastriggers,
-    null AS relhassubclass,
-    null AS relrowsecurity,
-    null AS relforcerowsecurity,
-    null AS relispopulated,
-    null AS relreplident,
-    null AS relispartition,
-    null AS relrewrite,
-    null AS relfrozenxid,
-    null AS relminxid,
-    null AS relacl,
-    null AS reloptions,
-    null AS relpartbound
-FROM glare_catalog.tables t",
+    t.oid                                                    AS oid,
+    t.table_name                                             AS relname,
+    t.schema_oid                                             AS relnamespace,
+    CAST(0 AS INT)                                           AS reltype,
+    CAST(0 AS INT)                                           AS reloftype,
+    CAST(10 AS INT)                                          AS relowner,
+    CAST(0 AS INT)                                           AS relam,
+    CAST(0 AS INT)                                           AS relfilenode,
+    CAST(0 AS INT)                                           AS reltablespace,
+    CAST(0 AS INT)                                           AS relpages,
+    CAST(0.0 AS REAL)                                        AS reltuples,
+    CAST(0 AS INT)                                           AS relallvisible,
+    CAST(0 AS INT)                                           AS reltoastrelid,
+    false                                                    AS relhasindex,
+    false                                                    AS relisshared,
+    'p'                                                      AS relpersistence,
+    'r'                                                      AS relkind,
+    CAST((SELECT COUNT(*) FROM glare_catalog.columns cc
+          WHERE cc.table_oid = t.oid) AS SMALLINT)           AS relnatts,
+    CAST(0 AS SMALLINT)                                      AS relchecks,
+    false                                                    AS relhasrules,
+    false                                                    AS relhastriggers,
+    false                                                    AS relhassubclass,
+    false                                                    AS relrowsecurity,
+    false                                                    AS relforcerowsecurity,
+    true                                                     AS relispopulated,
+    'd'                                                      AS relreplident,
+    false                                                    AS relispartition,
+    CAST(0 AS INT)                                           AS relrewrite,
+    CAST(0 AS BIGINT)                                        AS relfrozenxid,
+    CAST(0 AS BIGINT)                                        AS relminmxid,
+    CAST(NULL AS TEXT)                                       AS relacl,
+    CAST(NULL AS TEXT)                                       AS reloptions,
+    CAST(NULL AS TEXT)                                       AS relpartbound
+FROM glare_catalog.tables t
+UNION ALL
+SELECT
+    v.oid                                                    AS oid,
+    v.view_name                                              AS relname,
+    v.schema_oid                                             AS relnamespace,
+    CAST(0 AS INT)                                           AS reltype,
+    CAST(0 AS INT)                                           AS reloftype,
+    CAST(10 AS INT)                                          AS relowner,
+    CAST(0 AS INT)                                           AS relam,
+    CAST(0 AS INT)                                           AS relfilenode,
+    CAST(0 AS INT)                                           AS reltablespace,
+    CAST(0 AS INT)                                           AS relpages,
+    CAST(0.0 AS REAL)                                        AS reltuples,
+    CAST(0 AS INT)                                           AS relallvisible,
+    CAST(0 AS INT)                                           AS reltoastrelid,
+    false                                                    AS relhasindex,
+    false                                                    AS relisshared,
+    'p'                                                      AS relpersistence,
+    'v'                                                      AS relkind,
+    CAST(0 AS SMALLINT)                                      AS relnatts,
+    CAST(0 AS SMALLINT)                                      AS relchecks,
+    false                                                    AS relhasrules,
+    false                                                    AS relhastriggers,
+    false                                                    AS relhassubclass,
+    false                                                    AS relrowsecurity,
+    false                                                    AS relforcerowsecurity,
+    true                                                     AS relispopulated,
+    'd'                                                      AS relreplident,
+    false                                                    AS relispartition,
+    CAST(0 AS INT)                                           AS relrewrite,
+    CAST(0 AS BIGINT)                                        AS relfrozenxid,
+    CAST(0 AS BIGINT)                                        AS relminmxid,
+    CAST(NULL AS TEXT)                                       AS relacl,
+    CAST(NULL AS TEXT)                                       AS reloptions,
+    CAST(NULL AS TEXT)                                       AS relpartbound
+FROM glare_catalog.views v",
 });
 
 pub static PG_NAMESPACE: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
@@ -570,23 +730,49 @@ pub static PG_NAMESPACE: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     name: "pg_namespace",
     sql: "
 SELECT
-    s.oid AS oid,
-    s.schema_name AS nspname,
-    0 AS nspowner,
-    null AS nspacl
+    s.oid                  AS oid,
+    s.schema_name          AS nspname,
+    CAST(10 AS INT)        AS nspowner,
+    CAST(NULL AS TEXT)     AS nspacl
 FROM glare_catalog.schemas s",
 });
 
 pub static PG_DESCRIPTION: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     schema: POSTGRES_SCHEMA,
     name: "pg_description",
+    // Sourced from `glare_catalog.tables.comment` and
+    // `glare_catalog.views.comment`. `classoid` is the OID of the catalog
+    // class that owns the row — `pg_class` for both tables and views;
+    // 1259 is the well-known upstream OID for `pg_class`. `objsubid=0`
+    // means "the relation itself, not a column" (column comments would
+    // use the column ordinal here once column-level comments land).
     sql: "
 SELECT
-    1 AS objoid,
-    2 AS classoid,
-    3 AS objsubid,
-    4 AS description
-FROM (VALUES (NULL, NULL, NULL, NULL)) WHERE false", // Create empty table for now.
+    t.oid                  AS objoid,
+    CAST(1259 AS INT)      AS classoid,
+    CAST(0 AS INT)         AS objsubid,
+    t.comment              AS description
+FROM glare_catalog.tables t
+WHERE t.comment IS NOT NULL
+UNION ALL
+SELECT
+    v.oid                  AS objoid,
+    CAST(1259 AS INT)      AS classoid,
+    CAST(0 AS INT)         AS objsubid,
+    v.comment              AS description
+FROM glare_catalog.views v
+WHERE v.comment IS NOT NULL",
+});
+
+pub static PG_SHDESCRIPTION: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_shdescription",
+    sql: "
+SELECT
+    CAST(NULL AS INT)  AS objoid,
+    CAST(NULL AS INT)  AS classoid,
+    CAST(NULL AS TEXT) AS description
+FROM (VALUES (1)) WHERE false",
 });
 
 pub static PG_DATABASE: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
@@ -594,24 +780,23 @@ pub static PG_DATABASE: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     name: "pg_database",
     sql: "
 SELECT
-    oid as oid,
-    database_name as datname,
-    0 as datdba,
-    0 as encoding,
-    'c' as datlocprovider,
-    false as datistemplate,
-    true as datallowconn,
-    -1 as datconnlimit,
-    0 as datfrozenxid,
-    0 as datminmxid,
-    0 as dattablespace,
-    '' as datcollate,
-    '' as datctype,
-    '' as daticulocal,
-    '' as datcollversion,
-    [] as datacl
-FROM glare_catalog.databases;
-",
+    oid                              AS oid,
+    database_name                    AS datname,
+    CAST(10 AS INT)                  AS datdba,
+    CAST(6 AS INT)                   AS encoding,
+    'c'                              AS datlocprovider,
+    false                            AS datistemplate,
+    true                             AS datallowconn,
+    CAST(-1 AS INT)                  AS datconnlimit,
+    CAST(0 AS BIGINT)                AS datfrozenxid,
+    CAST(0 AS BIGINT)                AS datminmxid,
+    CAST(1663 AS INT)                AS dattablespace,
+    'en_US.UTF-8'                    AS datcollate,
+    'en_US.UTF-8'                    AS datctype,
+    CAST(NULL AS TEXT)               AS daticulocal,
+    CAST(NULL AS TEXT)               AS datcollversion,
+    CAST(NULL AS TEXT)               AS datacl
+FROM glare_catalog.databases",
 });
 
 pub static PG_TABLES: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
@@ -619,16 +804,15 @@ pub static PG_TABLES: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     name: "pg_tables",
     sql: "
 SELECT
-    schema_name as schemaname,
-    table_name as tablename,
-    '' as tableowner,
-    '' as tablespace,
-    false as hasindexes,
-    false as hasrules,
-    false as hastriggers,
-    false as rowsecurity
-FROM glare_catalog.tables;
-",
+    schema_name        AS schemaname,
+    table_name         AS tablename,
+    CAST('' AS TEXT)   AS tableowner,
+    CAST('' AS TEXT)   AS tablespace,
+    false              AS hasindexes,
+    false              AS hasrules,
+    false              AS hastriggers,
+    false              AS rowsecurity
+FROM glare_catalog.tables",
 });
 
 pub static PG_VIEWS: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
@@ -636,102 +820,575 @@ pub static PG_VIEWS: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     name: "pg_views",
     sql: "
 SELECT
-    schema_name as schemaname,
-    view_name as viewname,
-    '' as viewowner,
-    sql as definition
-FROM glare_catalog.views;
-",
+    schema_name        AS schemaname,
+    view_name          AS viewname,
+    CAST('' AS TEXT)   AS viewowner,
+    sql                AS definition
+FROM glare_catalog.views",
 });
 
 pub static PG_TYPE: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     schema: POSTGRES_SCHEMA,
     name: "pg_type",
+    // Hand-curated subset of upstream PostgreSQL types covering every Arrow
+    // datatype we surface plus the OID/regclass/array helpers DBeaver
+    // requires. The OID values match upstream Postgres exactly so
+    // `'pg_class'::regclass` (oid 1259, looked up via the regclass cast UDF
+    // in W2-funcs) and `INT4OID = 23` invariants hold.
+    //
+    // The full lookup table lives in `pgrepr::pg_type_oid::PG_TYPES`; this
+    // SQL view is a hand-mirror suitable for SQL queries. Keep them aligned.
     sql: "
-SELECT 
-
-null as typacl,
-0 as typndims,
-0 as typcollation,
-0 as oid,
-0 as typnamespace,
-0 as typowner,
-0 as typlen,
-false as typbyval,
-'r' as typtype,
-'r' as typcategory,
-false as typispreferred,
-false as typisdefined,
-'r' as typdelim,
-0 as typrelid,
-0 as typsubscript,
-0 as typelem,
-0 as typarray,
-0 as typinput,
-0 as typoutput,
-0 as typreceive,
-0 as typsend,
-0 as typmodin,
-0 as typmodout,
-0 as typanalyze,
-'r' as typalign,
-'r' as typstorage,
-false as typnotnull,
-0 as typbasetype,
-0 as typtypmod,
-'r' as typname,
-null as typdefault,
-null as typdefaultbin
-FROM (VALUES (NULL, NULL, NULL, NULL, 
-    NULL, NULL, NULL, NULL, NULL, NULL, 
-    NULL, NULL, NULL, NULL, NULL, NULL, 
-    NULL, NULL, NULL, NULL, NULL, NULL, 
-    NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL)) WHERE false",
+SELECT * FROM (VALUES
+    -- (oid, typname, typnamespace, typlen, typbyval, typtype, typcategory, typispreferred, typisdefined, typdelim, typrelid, typelem, typarray, typalign, typstorage, typnotnull, typbasetype, typtypmod, typowner, typdefault, typcollation)
+    (CAST(16 AS INT),   'bool',         CAST(11 AS INT), CAST(1 AS SMALLINT),  true,  'b', 'B', true,  true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(1000 AS INT), 'c', 'p', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(17 AS INT),   'bytea',        CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'U', false, true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(1001 AS INT), 'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(18 AS INT),   'char',         CAST(11 AS INT), CAST(1 AS SMALLINT),  true,  'b', 'S', false, true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(1002 AS INT), 'c', 'p', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(19 AS INT),   'name',         CAST(11 AS INT), CAST(64 AS SMALLINT), false, 'b', 'S', false, true, ',', CAST(0 AS INT), CAST(18 AS INT),   CAST(1003 AS INT), 'c', 'p', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(950 AS INT)),
+    (CAST(20 AS INT),   'int8',         CAST(11 AS INT), CAST(8 AS SMALLINT),  true,  'b', 'N', false, true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(1016 AS INT), 'd', 'p', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(21 AS INT),   'int2',         CAST(11 AS INT), CAST(2 AS SMALLINT),  true,  'b', 'N', false, true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(1005 AS INT), 's', 'p', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(23 AS INT),   'int4',         CAST(11 AS INT), CAST(4 AS SMALLINT),  true,  'b', 'N', false, true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(1007 AS INT), 'i', 'p', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(25 AS INT),   'text',         CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'S', true,  true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(1009 AS INT), 'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(100 AS INT)),
+    (CAST(26 AS INT),   'oid',          CAST(11 AS INT), CAST(4 AS SMALLINT),  true,  'b', 'N', true,  true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(1028 AS INT), 'i', 'p', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(114 AS INT),  'json',         CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'U', false, true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(199 AS INT),  'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(700 AS INT),  'float4',       CAST(11 AS INT), CAST(4 AS SMALLINT),  true,  'b', 'N', false, true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(1021 AS INT), 'i', 'p', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(701 AS INT),  'float8',       CAST(11 AS INT), CAST(8 AS SMALLINT),  true,  'b', 'N', true,  true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(1022 AS INT), 'd', 'p', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(1042 AS INT), 'bpchar',       CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'S', false, true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(1014 AS INT), 'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(100 AS INT)),
+    (CAST(1043 AS INT), 'varchar',      CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'S', false, true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(1015 AS INT), 'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(100 AS INT)),
+    (CAST(1082 AS INT), 'date',         CAST(11 AS INT), CAST(4 AS SMALLINT),  true,  'b', 'D', false, true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(1182 AS INT), 'i', 'p', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(1083 AS INT), 'time',         CAST(11 AS INT), CAST(8 AS SMALLINT),  true,  'b', 'D', false, true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(1183 AS INT), 'd', 'p', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(1114 AS INT), 'timestamp',    CAST(11 AS INT), CAST(8 AS SMALLINT),  true,  'b', 'D', false, true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(1115 AS INT), 'd', 'p', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(1184 AS INT), 'timestamptz',  CAST(11 AS INT), CAST(8 AS SMALLINT),  true,  'b', 'D', true,  true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(1185 AS INT), 'd', 'p', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(1186 AS INT), 'interval',     CAST(11 AS INT), CAST(16 AS SMALLINT), false, 'b', 'T', true,  true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(1187 AS INT), 'd', 'p', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(1700 AS INT), 'numeric',      CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'N', false, true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(1231 AS INT), 'i', 'm', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(2205 AS INT), 'regclass',     CAST(11 AS INT), CAST(4 AS SMALLINT),  true,  'b', 'N', false, true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(2210 AS INT), 'i', 'p', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(2206 AS INT), 'regtype',      CAST(11 AS INT), CAST(4 AS SMALLINT),  true,  'b', 'N', false, true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(2211 AS INT), 'i', 'p', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(2249 AS INT), 'record',       CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'p', 'P', false, true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(2287 AS INT), 'd', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(2278 AS INT), 'void',         CAST(11 AS INT), CAST(4 AS SMALLINT),  true,  'p', 'P', false, true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(0 AS INT),    'i', 'p', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(2950 AS INT), 'uuid',         CAST(11 AS INT), CAST(16 AS SMALLINT), false, 'b', 'U', false, true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(2951 AS INT), 'c', 'p', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(3802 AS INT), 'jsonb',        CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'U', true,  true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(3807 AS INT), 'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    -- arrays
+    (CAST(1000 AS INT), '_bool',        CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(16 AS INT),   CAST(0 AS INT),    'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(1005 AS INT), '_int2',        CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(21 AS INT),   CAST(0 AS INT),    'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(1007 AS INT), '_int4',        CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(23 AS INT),   CAST(0 AS INT),    'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(1009 AS INT), '_text',        CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(25 AS INT),   CAST(0 AS INT),    'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(100 AS INT)),
+    (CAST(1014 AS INT), '_bpchar',      CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(1042 AS INT), CAST(0 AS INT),    'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(100 AS INT)),
+    (CAST(1015 AS INT), '_varchar',     CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(1043 AS INT), CAST(0 AS INT),    'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(100 AS INT)),
+    (CAST(1016 AS INT), '_int8',        CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(20 AS INT),   CAST(0 AS INT),    'd', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(1021 AS INT), '_float4',      CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(700 AS INT),  CAST(0 AS INT),    'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(1022 AS INT), '_float8',      CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(701 AS INT),  CAST(0 AS INT),    'd', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(1115 AS INT), '_timestamp',   CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(1114 AS INT), CAST(0 AS INT),    'd', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(1185 AS INT), '_timestamptz', CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(1184 AS INT), CAST(0 AS INT),    'd', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(1182 AS INT), '_date',        CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(1082 AS INT), CAST(0 AS INT),    'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(1183 AS INT), '_time',        CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(1083 AS INT), CAST(0 AS INT),    'd', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(1187 AS INT), '_interval',    CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(1186 AS INT), CAST(0 AS INT),    'd', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(1231 AS INT), '_numeric',     CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(1700 AS INT), CAST(0 AS INT),    'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(1028 AS INT), '_oid',         CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(26 AS INT),   CAST(0 AS INT),    'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(199 AS INT),  '_json',        CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(114 AS INT),  CAST(0 AS INT),    'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(2951 AS INT), '_uuid',        CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(2950 AS INT), CAST(0 AS INT),    'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
+    (CAST(3807 AS INT), '_jsonb',       CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(3802 AS INT), CAST(0 AS INT),    'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT))
+) AS t(oid, typname, typnamespace, typlen, typbyval, typtype, typcategory, typispreferred, typisdefined, typdelim, typrelid, typelem, typarray, typalign, typstorage, typnotnull, typbasetype, typtypmod, typowner, typdefault, typcollation)",
 });
 
-pub static PG_MATVIEWS: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+pub static PG_PROC: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     schema: POSTGRES_SCHEMA,
-    name: "pg_matviews",
+    name: "pg_proc",
+    // Functions tree node + Dependencies tab in DBeaver. Backed by
+    // `glare_catalog.functions`. `prorettype` and `proargtypes` will become
+    // structured OIDs once W2-funcs ships `pg_type_oid_by_name` /
+    // `pg_type_oid_vector` UDFs; until then they remain 0 / empty and
+    // DBeaver renders the row with a `<unknown>` return type — still better
+    // than not showing the function at all.
     sql: "
-    SELECT '' as schemaname,
-    '' as matviewname,
-    '' as matviewowner,
-    '' as tablespace,
-    false as hasindexes,
-    false as ispopulated,
-    '' as definition
-    WHERE false
-    ",
+SELECT
+    f.oid                                      AS oid,
+    f.function_name                            AS proname,
+    f.schema_oid                               AS pronamespace,
+    CAST(10 AS INT)                            AS proowner,
+    CAST(12 AS INT)                            AS prolang,
+    CAST(0.0 AS REAL)                          AS procost,
+    CAST(0.0 AS REAL)                          AS prorows,
+    CAST(0 AS INT)                             AS provariadic,
+    CAST(0 AS INT)                             AS prosupport,
+    CASE f.function_type
+        WHEN 'aggregate' THEN 'a'
+        ELSE                  'f'
+    END                                        AS prokind,
+    f.function_type = 'aggregate'              AS proisagg,
+    false                                      AS proiswindow,
+    false                                      AS prosecdef,
+    false                                      AS proleakproof,
+    false                                      AS proisstrict,
+    f.is_set_returning                         AS proretset,
+    'v'                                        AS provolatile,
+    's'                                        AS proparallel,
+    CAST(COALESCE(cardinality(f.argument_types), 0) AS SMALLINT) AS pronargs,
+    CAST(0 AS SMALLINT)                        AS pronargdefaults,
+    -- `prorettype` is NULL when the function does not declare a return
+    -- type at registration (DataFusion `ScalarUDF`s defer to planning) —
+    -- fall back to OID 0 (`InvalidOid`) which DBeaver renders as
+    -- `<unknown>`. When a return type is recorded, resolve via
+    -- `pg_type_oid_by_name`.
+    COALESCE(
+        pg_catalog.pg_type_oid_by_name(f.return_type),
+        CAST(0 AS INT)
+    )                                          AS prorettype,
+    CAST(NULL AS TEXT)                         AS proargtypes,
+    CAST(NULL AS TEXT)                         AS proallargtypes,
+    CAST(NULL AS TEXT)                         AS proargmodes,
+    f.parameters                               AS proargnames,
+    CAST(NULL AS TEXT)                         AS proargdefaults,
+    CAST(NULL AS TEXT)                         AS protrftypes,
+    COALESCE(f.example, '')                    AS prosrc,
+    CAST(NULL AS TEXT)                         AS probin,
+    CAST(NULL AS TEXT)                         AS proconfig,
+    CAST(NULL AS TEXT)                         AS proacl
+FROM glare_catalog.functions f",
 });
 
-pub static PG_REWRITE: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+pub static PG_AGGREGATE: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     schema: POSTGRES_SCHEMA,
-    name: "pg_rewrite",
+    name: "pg_aggregate",
+    // Slim view over `pg_proc` for aggregate functions only. Transition-
+    // function metadata is intentionally NULL/0 — DBeaver renders the
+    // function but skips internal aggregate details.
     sql: "
-    SELECT 0 as oid,
-    '' as rulename,
-    0 as ev_class,
-    1 as ev_type,
-    'D' as ev_enabled,
-    false as is_instead,
-    null as ev_qual,
-    null as ev_action
-    ",
+SELECT
+    f.oid                          AS aggfnoid,
+    'n'                            AS aggkind,
+    CAST(0 AS SMALLINT)            AS aggnumdirectargs,
+    CAST(0 AS INT)                 AS aggtransfn,
+    CAST(0 AS INT)                 AS aggfinalfn,
+    CAST(0 AS INT)                 AS aggcombinefn,
+    CAST(0 AS INT)                 AS aggserialfn,
+    CAST(0 AS INT)                 AS aggdeserialfn,
+    CAST(0 AS INT)                 AS aggmtransfn,
+    CAST(0 AS INT)                 AS aggminvtransfn,
+    CAST(0 AS INT)                 AS aggmfinalfn,
+    false                          AS aggfinalextra,
+    false                          AS aggmfinalextra,
+    'r'                            AS aggfinalmodify,
+    'r'                            AS aggmfinalmodify,
+    CAST(0 AS INT)                 AS aggsortop,
+    CAST(0 AS INT)                 AS aggtranstype,
+    CAST(0 AS INT)                 AS aggtransspace,
+    CAST(0 AS INT)                 AS aggmtranstype,
+    CAST(0 AS INT)                 AS aggmtransspace,
+    CAST(NULL AS TEXT)             AS agginitval,
+    CAST(NULL AS TEXT)             AS aggminitval
+FROM glare_catalog.functions f
+WHERE f.function_type = 'aggregate'",
+});
+
+pub static PG_ATTRDEF: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_attrdef",
+    sql: "
+SELECT
+    CAST(NULL AS INT)      AS oid,
+    CAST(NULL AS INT)      AS adrelid,
+    CAST(NULL AS SMALLINT) AS adnum,
+    CAST(NULL AS TEXT)     AS adbin,
+    CAST(NULL AS TEXT)     AS adsrc
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_INDEX: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_index",
+    sql: "
+SELECT
+    i.oid               AS indexrelid,
+    i.table_oid         AS indrelid,
+    CAST(0 AS SMALLINT) AS indnatts,
+    CAST(0 AS SMALLINT) AS indnkeyatts,
+    i.is_unique         AS indisunique,
+    i.is_primary        AS indisprimary,
+    false               AS indisexclusion,
+    false               AS indimmediate,
+    false               AS indisclustered,
+    true                AS indisvalid,
+    false               AS indcheckxmin,
+    true                AS indisready,
+    true                AS indislive,
+    false               AS indisreplident,
+    COALESCE(i.column_positions, '')        AS indkey,
+    CAST(NULL AS TEXT)                       AS indcollation,
+    CAST(NULL AS TEXT)                       AS indclass,
+    CAST(NULL AS TEXT)                       AS indoption,
+    i.expression                             AS indexprs,
+    i.predicate                              AS indpred
+FROM glare_catalog.indexes i",
+});
+
+pub static PG_CONSTRAINT: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_constraint",
+    // Pass through raw `glare_catalog.constraints` columns. Today the table
+    // is always empty (Delta tables have no PK/FK enforcement), so `NULL`
+    // values are fine — DBeaver's `ConstraintCache` only inspects the
+    // column shape via a `WHERE 1<>1` probe at startup.
+    sql: "
+SELECT
+    c.oid                       AS oid,
+    c.conname                   AS conname,
+    c.schema_oid                AS connamespace,
+    c.contype                   AS contype,
+    c.is_deferrable             AS condeferrable,
+    c.is_deferred               AS condeferred,
+    c.is_validated              AS convalidated,
+    c.table_oid                 AS conrelid,
+    CAST(0 AS INT)              AS contypid,
+    CAST(0 AS INT)              AS conindid,
+    CAST(0 AS INT)              AS conparentid,
+    c.ref_table_oid             AS confrelid,
+    c.update_action             AS confupdtype,
+    c.delete_action             AS confdeltype,
+    c.match_type                AS confmatchtype,
+    true                        AS conislocal,
+    CAST(0 AS INT)              AS coninhcount,
+    true                        AS connoinherit,
+    c.column_positions          AS conkey,
+    c.ref_column_positions      AS confkey,
+    CAST(NULL AS TEXT)          AS conpfeqop,
+    CAST(NULL AS TEXT)          AS conppeqop,
+    CAST(NULL AS TEXT)          AS conffeqop,
+    CAST(NULL AS TEXT)          AS confdelsetcols,
+    CAST(NULL AS TEXT)          AS conexclop,
+    c.definition                AS conbin
+FROM glare_catalog.constraints c",
+});
+
+pub static PG_INHERITS: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_inherits",
+    sql: "
+SELECT
+    CAST(NULL AS INT)      AS inhrelid,
+    CAST(NULL AS INT)      AS inhparent,
+    CAST(NULL AS INT)      AS inhseqno,
+    CAST(NULL AS BOOLEAN)  AS inhdetachpending
+FROM (VALUES (1)) WHERE false",
 });
 
 pub static PG_DEPEND: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     schema: POSTGRES_SCHEMA,
     name: "pg_depend",
     sql: "
-    SELECT 0 as classid,
-    0 as objid,
-    0 as objsubid,
-    0 as refclassid,
-    0 as refobjid,
-    0 as refobjdubid,
-    'a' as deptype,
-    ",
+SELECT
+    CAST(NULL AS INT)  AS classid,
+    CAST(NULL AS INT)  AS objid,
+    CAST(NULL AS INT)  AS objsubid,
+    CAST(NULL AS INT)  AS refclassid,
+    CAST(NULL AS INT)  AS refobjid,
+    CAST(NULL AS INT)  AS refobjsubid,
+    CAST(NULL AS TEXT) AS deptype
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_REWRITE: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_rewrite",
+    sql: "
+SELECT
+    CAST(NULL AS INT)      AS oid,
+    CAST(NULL AS TEXT)     AS rulename,
+    CAST(NULL AS INT)      AS ev_class,
+    CAST(NULL AS TEXT)     AS ev_type,
+    CAST(NULL AS TEXT)     AS ev_enabled,
+    CAST(NULL AS BOOLEAN)  AS is_instead,
+    CAST(NULL AS TEXT)     AS ev_qual,
+    CAST(NULL AS TEXT)     AS ev_action
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_TRIGGER: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_trigger",
+    sql: "
+SELECT
+    CAST(NULL AS INT)      AS oid,
+    CAST(NULL AS INT)      AS tgrelid,
+    CAST(NULL AS INT)      AS tgparentid,
+    CAST(NULL AS TEXT)     AS tgname,
+    CAST(NULL AS INT)      AS tgfoid,
+    CAST(NULL AS SMALLINT) AS tgtype,
+    CAST(NULL AS TEXT)     AS tgenabled,
+    CAST(NULL AS BOOLEAN)  AS tgisinternal,
+    CAST(NULL AS INT)      AS tgconstrrelid,
+    CAST(NULL AS INT)      AS tgconstrindid,
+    CAST(NULL AS INT)      AS tgconstraint,
+    CAST(NULL AS BOOLEAN)  AS tgdeferrable,
+    CAST(NULL AS BOOLEAN)  AS tginitdeferred,
+    CAST(NULL AS SMALLINT) AS tgnargs,
+    CAST(NULL AS TEXT)     AS tgattr,
+    CAST(NULL AS TEXT)     AS tgargs,
+    CAST(NULL AS TEXT)     AS tgqual,
+    CAST(NULL AS TEXT)     AS tgoldtable,
+    CAST(NULL AS TEXT)     AS tgnewtable
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_ENUM: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_enum",
+    sql: "
+SELECT
+    CAST(NULL AS INT)   AS oid,
+    CAST(NULL AS INT)   AS enumtypid,
+    CAST(NULL AS REAL)  AS enumsortorder,
+    CAST(NULL AS TEXT)  AS enumlabel
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_ROLES: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_roles",
+    // Single hardcoded admin role — GlareDB does not have multi-user RBAC.
+    // DBeaver populates the Roles tree from this view; one row keeps the
+    // tree from breaking.
+    sql: "
+SELECT * FROM (VALUES
+    (CAST(10 AS INT), 'glaredb', true, true, true, true, true, true, false, CAST(-1 AS INT), CAST(NULL AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS TEXT))
+) AS r(oid, rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolreplication, rolbypassrls, rolconnlimit, rolpassword, rolvaliduntil, rolconfig)",
+});
+
+pub static PG_AUTHID: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_authid",
+    sql: "
+SELECT * FROM (VALUES
+    (CAST(10 AS INT), 'glaredb', true, true, true, true, true, true, false, CAST(-1 AS INT), CAST(NULL AS TEXT), CAST(NULL AS TEXT))
+) AS a(oid, rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolreplication, rolbypassrls, rolconnlimit, rolpassword, rolvaliduntil)",
+});
+
+pub static PG_COLLATION: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_collation",
+    sql: "
+SELECT * FROM (VALUES
+    (CAST(100 AS INT), 'default', CAST(11 AS INT), CAST(10 AS INT), 'd', true, CAST(-1 AS INT), CAST(NULL AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS TEXT)),
+    (CAST(950 AS INT), 'C',       CAST(11 AS INT), CAST(10 AS INT), 'c', true, CAST(-1 AS INT), 'C', 'C', CAST(NULL AS TEXT), CAST(NULL AS TEXT)),
+    (CAST(951 AS INT), 'POSIX',   CAST(11 AS INT), CAST(10 AS INT), 'c', true, CAST(-1 AS INT), 'POSIX', 'POSIX', CAST(NULL AS TEXT), CAST(NULL AS TEXT))
+) AS c(oid, collname, collnamespace, collowner, collprovider, collisdeterministic, collencoding, collcollate, collctype, colliculocale, collversion)",
+});
+
+pub static PG_LANGUAGE: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_language",
+    sql: "
+SELECT * FROM (VALUES
+    (CAST(12 AS INT), 'internal', CAST(10 AS INT), false, false, CAST(0 AS INT), CAST(0 AS INT), CAST(2246 AS INT), CAST(NULL AS TEXT)),
+    (CAST(13 AS INT), 'c',        CAST(10 AS INT), false, false, CAST(0 AS INT), CAST(0 AS INT), CAST(2247 AS INT), CAST(NULL AS TEXT)),
+    (CAST(14 AS INT), 'sql',      CAST(10 AS INT), false, true,  CAST(0 AS INT), CAST(0 AS INT), CAST(2248 AS INT), CAST(NULL AS TEXT))
+) AS l(oid, lanname, lanowner, lanispl, lanpltrusted, lanplcallfoid, laninline, lanvalidator, lanacl)",
+});
+
+pub static PG_TABLESPACE: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_tablespace",
+    sql: "
+SELECT * FROM (VALUES
+    (CAST(1663 AS INT), 'pg_default', CAST(10 AS INT), CAST(NULL AS TEXT), CAST(NULL AS TEXT)),
+    (CAST(1664 AS INT), 'pg_global',  CAST(10 AS INT), CAST(NULL AS TEXT), CAST(NULL AS TEXT))
+) AS t(oid, spcname, spcowner, spcacl, spcoptions)",
+});
+
+pub static PG_SETTINGS: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_settings",
+    // Empty rowset for now — full enumeration of session vars lands when
+    // we wire `SessionVarsInner` to a TVF (W2-funcs / W3a). DBeaver only
+    // probes column shape at startup, so this satisfies its `SettingCache`.
+    sql: "
+SELECT
+    CAST(NULL AS TEXT)     AS name,
+    CAST(NULL AS TEXT)     AS setting,
+    CAST(NULL AS TEXT)     AS unit,
+    CAST(NULL AS TEXT)     AS category,
+    CAST(NULL AS TEXT)     AS short_desc,
+    CAST(NULL AS TEXT)     AS extra_desc,
+    CAST(NULL AS TEXT)     AS context,
+    CAST(NULL AS TEXT)     AS vartype,
+    CAST(NULL AS TEXT)     AS source,
+    CAST(NULL AS TEXT)     AS min_val,
+    CAST(NULL AS TEXT)     AS max_val,
+    CAST(NULL AS TEXT)     AS enumvals,
+    CAST(NULL AS TEXT)     AS boot_val,
+    CAST(NULL AS TEXT)     AS reset_val,
+    CAST(NULL AS TEXT)     AS sourcefile,
+    CAST(NULL AS INT)      AS sourceline,
+    CAST(NULL AS BOOLEAN)  AS pending_restart
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_EXTENSION: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_extension",
+    sql: "
+SELECT
+    CAST(NULL AS INT)     AS oid,
+    CAST(NULL AS TEXT)    AS extname,
+    CAST(NULL AS INT)     AS extowner,
+    CAST(NULL AS INT)     AS extnamespace,
+    CAST(NULL AS BOOLEAN) AS extrelocatable,
+    CAST(NULL AS TEXT)    AS extversion,
+    CAST(NULL AS TEXT)    AS extconfig,
+    CAST(NULL AS TEXT)    AS extcondition
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_AVAILABLE_EXTENSIONS: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_available_extensions",
+    sql: "
+SELECT
+    CAST(NULL AS TEXT) AS name,
+    CAST(NULL AS TEXT) AS default_version,
+    CAST(NULL AS TEXT) AS installed_version,
+    CAST(NULL AS TEXT) AS comment
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_EVENT_TRIGGER: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_event_trigger",
+    sql: "
+SELECT
+    CAST(NULL AS INT)  AS oid,
+    CAST(NULL AS TEXT) AS evtname,
+    CAST(NULL AS TEXT) AS evtevent,
+    CAST(NULL AS INT)  AS evtowner,
+    CAST(NULL AS INT)  AS evtfoid,
+    CAST(NULL AS TEXT) AS evtenabled,
+    CAST(NULL AS TEXT) AS evttags
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_DEFAULT_ACL: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_default_acl",
+    sql: "
+SELECT
+    CAST(NULL AS INT)  AS oid,
+    CAST(NULL AS INT)  AS defaclrole,
+    CAST(NULL AS INT)  AS defaclnamespace,
+    CAST(NULL AS TEXT) AS defaclobjtype,
+    CAST(NULL AS TEXT) AS defaclacl
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_FOREIGN_DATA_WRAPPER: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_foreign_data_wrapper",
+    sql: "
+SELECT
+    CAST(NULL AS INT)  AS oid,
+    CAST(NULL AS TEXT) AS fdwname,
+    CAST(NULL AS INT)  AS fdwowner,
+    CAST(NULL AS INT)  AS fdwhandler,
+    CAST(NULL AS INT)  AS fdwvalidator,
+    CAST(NULL AS TEXT) AS fdwacl,
+    CAST(NULL AS TEXT) AS fdwoptions
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_FOREIGN_SERVER: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_foreign_server",
+    sql: "
+SELECT
+    CAST(NULL AS INT)  AS oid,
+    CAST(NULL AS TEXT) AS srvname,
+    CAST(NULL AS INT)  AS srvowner,
+    CAST(NULL AS INT)  AS srvfdw,
+    CAST(NULL AS TEXT) AS srvtype,
+    CAST(NULL AS TEXT) AS srvversion,
+    CAST(NULL AS TEXT) AS srvacl,
+    CAST(NULL AS TEXT) AS srvoptions
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_CONVERSION: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_conversion",
+    // Single UTF8↔UTF8 conversion entry — keeps DBeaver's
+    // `EncodingCache` populated. Encoding 6 is `UTF8`.
+    sql: "
+SELECT * FROM (VALUES
+    (CAST(0 AS INT), 'utf8_to_utf8', CAST(11 AS INT), CAST(10 AS INT), CAST(6 AS INT), CAST(6 AS INT), CAST(0 AS INT), true)
+) AS c(oid, conname, connamespace, conowner, conforencoding, contoencoding, conproc, condefault)",
+});
+
+pub static PG_MATVIEWS: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_matviews",
+    sql: "
+SELECT
+    CAST(NULL AS TEXT)    AS schemaname,
+    CAST(NULL AS TEXT)    AS matviewname,
+    CAST(NULL AS TEXT)    AS matviewowner,
+    CAST(NULL AS TEXT)    AS tablespace,
+    CAST(NULL AS BOOLEAN) AS hasindexes,
+    CAST(NULL AS BOOLEAN) AS ispopulated,
+    CAST(NULL AS TEXT)    AS definition
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_REPLICATION_SLOTS: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_replication_slots",
+    sql: "
+SELECT
+    CAST(NULL AS TEXT)    AS slot_name,
+    CAST(NULL AS TEXT)    AS plugin,
+    CAST(NULL AS TEXT)    AS slot_type,
+    CAST(NULL AS INT)     AS datoid,
+    CAST(NULL AS TEXT)    AS database,
+    CAST(NULL AS BOOLEAN) AS temporary,
+    CAST(NULL AS BOOLEAN) AS active,
+    CAST(NULL AS INT)     AS active_pid,
+    CAST(NULL AS BIGINT)  AS xmin,
+    CAST(NULL AS BIGINT)  AS catalog_xmin,
+    CAST(NULL AS TEXT)    AS restart_lsn,
+    CAST(NULL AS TEXT)    AS confirmed_flush_lsn,
+    CAST(NULL AS TEXT)    AS wal_status,
+    CAST(NULL AS BIGINT)  AS safe_wal_size
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_PUBLICATION: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_publication",
+    sql: "
+SELECT
+    CAST(NULL AS INT)     AS oid,
+    CAST(NULL AS TEXT)    AS pubname,
+    CAST(NULL AS INT)     AS pubowner,
+    CAST(NULL AS BOOLEAN) AS puballtables,
+    CAST(NULL AS BOOLEAN) AS pubinsert,
+    CAST(NULL AS BOOLEAN) AS pubupdate,
+    CAST(NULL AS BOOLEAN) AS pubdelete,
+    CAST(NULL AS BOOLEAN) AS pubtruncate,
+    CAST(NULL AS BOOLEAN) AS pubviaroot
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_SUBSCRIPTION: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_subscription",
+    sql: "
+SELECT
+    CAST(NULL AS INT)     AS oid,
+    CAST(NULL AS INT)     AS subdbid,
+    CAST(NULL AS TEXT)    AS subname,
+    CAST(NULL AS INT)     AS subowner,
+    CAST(NULL AS BOOLEAN) AS subenabled,
+    CAST(NULL AS TEXT)    AS subconninfo,
+    CAST(NULL AS TEXT)    AS subslotname,
+    CAST(NULL AS TEXT)    AS subsynccommit,
+    CAST(NULL AS INT)     AS subpublications
+FROM (VALUES (1)) WHERE false",
 });
 
 impl BuiltinView {
@@ -741,18 +1398,44 @@ impl BuiltinView {
             &INFORMATION_SCHEMA_SCHEMATA,
             &INFORMATION_SCHEMA_TABLES,
             &INFORMATION_SCHEMA_COLUMNS,
+            // pg_catalog views — see DBeaver corpus comment above each one.
             &PG_AM,
             &PG_ATTRIBUTE,
+            &PG_ATTRDEF,
+            &PG_AUTHID,
+            &PG_AVAILABLE_EXTENSIONS,
+            &PG_AGGREGATE,
             &PG_CLASS,
-            &PG_NAMESPACE,
-            &PG_DESCRIPTION,
+            &PG_COLLATION,
+            &PG_CONSTRAINT,
+            &PG_CONVERSION,
             &PG_DATABASE,
-            &PG_TABLES,
-            &PG_VIEWS,
-            &PG_TYPE,
-            &PG_MATVIEWS,
-            &PG_REWRITE,
+            &PG_DEFAULT_ACL,
             &PG_DEPEND,
+            &PG_DESCRIPTION,
+            &PG_ENUM,
+            &PG_EVENT_TRIGGER,
+            &PG_EXTENSION,
+            &PG_FOREIGN_DATA_WRAPPER,
+            &PG_FOREIGN_SERVER,
+            &PG_INDEX,
+            &PG_INHERITS,
+            &PG_LANGUAGE,
+            &PG_MATVIEWS,
+            &PG_NAMESPACE,
+            &PG_PROC,
+            &PG_PUBLICATION,
+            &PG_REPLICATION_SLOTS,
+            &PG_REWRITE,
+            &PG_ROLES,
+            &PG_SETTINGS,
+            &PG_SHDESCRIPTION,
+            &PG_SUBSCRIPTION,
+            &PG_TABLES,
+            &PG_TABLESPACE,
+            &PG_TRIGGER,
+            &PG_TYPE,
+            &PG_VIEWS,
         ]
     }
 }

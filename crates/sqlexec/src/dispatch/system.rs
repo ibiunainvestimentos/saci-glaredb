@@ -15,10 +15,12 @@ use sqlbuiltins::builtins::{
     DATABASE_DEFAULT,
     GLARE_CACHED_EXTERNAL_DATABASE_TABLES,
     GLARE_COLUMNS,
+    GLARE_CONSTRAINTS,
     GLARE_CREDENTIALS,
     GLARE_DATABASES,
     GLARE_DEPLOYMENT_METADATA,
     GLARE_FUNCTIONS,
+    GLARE_INDEXES,
     GLARE_SCHEMAS,
     GLARE_SSH_KEYS,
     GLARE_TABLES,
@@ -80,12 +82,30 @@ impl<'a> SystemTableDispatcher<'a> {
         } else if GLARE_CACHED_EXTERNAL_DATABASE_TABLES.matches(schema, name) {
             self.load_persisted_table(&GLARE_CACHED_EXTERNAL_DATABASE_TABLES)
                 .await?
+        } else if GLARE_INDEXES.matches(schema, name) {
+            // Empty MemTable with the schema declared in builtins.rs — no
+            // index storage today (Delta tables do not have secondary
+            // indexes), but the columns must exist for `pg_catalog.pg_index`
+            // to project them.
+            Arc::new(self.build_empty_table(&GLARE_INDEXES))
+        } else if GLARE_CONSTRAINTS.matches(schema, name) {
+            Arc::new(self.build_empty_table(&GLARE_CONSTRAINTS))
         } else {
             return Err(DispatchError::MissingBuiltinTable {
                 schema: schema.to_string(),
                 name: name.to_string(),
             });
         })
+    }
+
+    /// Build an empty `MemTable` with the schema of a `BuiltinTable`. Used
+    /// for catalog tables whose rows aren't materialised today (e.g.
+    /// `glare_catalog.indexes`, `glare_catalog.constraints`) but whose
+    /// column shape must exist so `pg_catalog` views over them succeed.
+    fn build_empty_table(&self, table: &BuiltinTable) -> MemTable {
+        let arrow_schema = Arc::new(table.arrow_schema());
+        let empty = RecordBatch::new_empty(arrow_schema.clone());
+        MemTable::try_new(arrow_schema, vec![vec![empty]]).unwrap()
     }
 
     /// Load a persisted system table from storage.
@@ -290,6 +310,7 @@ impl<'a> SystemTableDispatcher<'a> {
         let mut external = BooleanBuilder::new();
         let mut datasource = StringBuilder::new();
         let mut access_mode = StringBuilder::new();
+        let mut comment = StringBuilder::new();
 
         for table in self
             .catalog
@@ -313,6 +334,7 @@ impl<'a> SystemTableDispatcher<'a> {
             table_name.append_value(&table.entry.get_meta().name);
             builtin.append_value(table.builtin);
             external.append_value(table.entry.get_meta().external);
+            comment.append_option(table.entry.get_meta().comment.as_deref());
 
             let table = match table.entry {
                 CatalogEntry::Table(table) => table,
@@ -335,6 +357,7 @@ impl<'a> SystemTableDispatcher<'a> {
             external.append_value(table.meta.external);
             datasource.append_value(table.options.as_str());
             access_mode.append_value(SourceAccessMode::ReadWrite.as_str());
+            comment.append_option(table.meta.comment.as_deref());
         }
 
         let batch = RecordBatch::try_new(
@@ -349,6 +372,7 @@ impl<'a> SystemTableDispatcher<'a> {
                 Arc::new(external.finish()),
                 Arc::new(datasource.finish()),
                 Arc::new(access_mode.finish()),
+                Arc::new(comment.finish()),
             ],
         )
         .unwrap();
@@ -425,12 +449,14 @@ impl<'a> SystemTableDispatcher<'a> {
         let mut view_name = StringBuilder::new();
         let mut builtin = BooleanBuilder::new();
         let mut sql = StringBuilder::new();
+        let mut comment = StringBuilder::new();
 
         for view in self
             .catalog
             .iter_entries()
             .filter(|ent| ent.entry_type() == EntryType::View)
         {
+            let view_meta_comment = view.entry.get_meta().comment.clone();
             let ent = match view.entry {
                 CatalogEntry::View(ent) => ent,
                 other => panic!("unexpected catalog entry: {:?}", other), // Bug
@@ -442,15 +468,16 @@ impl<'a> SystemTableDispatcher<'a> {
                     .map(|schema| schema.get_meta().parent)
                     .unwrap_or_default(),
             );
-            schema_oid.append_value(view.entry.get_meta().parent);
+            schema_oid.append_value(ent.meta.parent);
             schema_name.append_value(
                 view.parent_entry
                     .map(|schema| schema.get_meta().name.as_str())
                     .unwrap_or("<invalid>"),
             );
-            view_name.append_value(&view.entry.get_meta().name);
+            view_name.append_value(&ent.meta.name);
             builtin.append_value(view.builtin);
             sql.append_value(&ent.sql);
+            comment.append_option(view_meta_comment.as_deref());
         }
 
         let batch = RecordBatch::try_new(
@@ -463,6 +490,7 @@ impl<'a> SystemTableDispatcher<'a> {
                 Arc::new(view_name.finish()),
                 Arc::new(builtin.finish()),
                 Arc::new(sql.finish()),
+                Arc::new(comment.finish()),
             ],
         )
         .unwrap();
@@ -481,6 +509,9 @@ impl<'a> SystemTableDispatcher<'a> {
         let mut builtin = BooleanBuilder::new();
         let mut sql_examples = StringBuilder::new();
         let mut descriptions = StringBuilder::new();
+        let mut argument_types = ListBuilder::new(StringBuilder::new());
+        let mut return_type = StringBuilder::new();
+        let mut is_set_returning = BooleanBuilder::new();
 
         for func in self
             .catalog
@@ -509,11 +540,35 @@ impl<'a> SystemTableDispatcher<'a> {
                     .map(Some)
                     .collect::<Vec<_>>();
                 parameters.append_value(sigs);
+
+                // Populate the structured argument-type list — one entry per
+                // positional argument of the *first* `Exact` signature
+                // (drilling through `OneOf`). Functions with no `Exact`
+                // signature get an empty list; we'd rather under-populate
+                // `pg_proc.proargtypes` than guess. See
+                // `first_exact_arg_types` for the picking rule.
+                let arg_names = first_exact_arg_types(&sig.type_signature)
+                    .map(|v| v.into_iter().map(Some).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                argument_types.append_value(arg_names);
             } else {
                 parameters.append_value(EMPTY);
+                argument_types.append_value(EMPTY);
             }
 
             builtin.append_value(func.builtin);
+
+            // Return type isn't carried on `FunctionEntry` today — DataFusion
+            // `ScalarUDF`s defer return-type resolution to planning. We leave
+            // it NULL for now; downstream `pg_proc.prorettype` falls back to
+            // OID 0 (`InvalidOid`) which DBeaver renders as `<unknown>`.
+            return_type.append_null();
+
+            // Table-returning functions are the set-returning ones.
+            is_set_returning.append_value(matches!(
+                ent.func_type,
+                protogen::metastore::types::catalog::FunctionType::TableReturning,
+            ));
         }
 
         let batch = RecordBatch::try_new(
@@ -527,6 +582,9 @@ impl<'a> SystemTableDispatcher<'a> {
                 Arc::new(builtin.finish()),
                 Arc::new(sql_examples.finish()),
                 Arc::new(descriptions.finish()),
+                Arc::new(argument_types.finish()),
+                Arc::new(return_type.finish()),
+                Arc::new(is_set_returning.finish()),
             ],
         )
         .unwrap();
@@ -636,4 +694,32 @@ pub(crate) fn join_types<T: Iterator<Item = U>, U: std::fmt::Display>(
         .map(|t| t.to_string())
         .collect::<Vec<String>>()
         .join(delimiter)
+}
+
+/// Return the positional argument types of the first `Exact` signature of
+/// a function, formatted as Arrow type names (`Int32`, `Utf8`, etc).
+///
+/// `OneOf` is drilled through to find the first `Exact` branch — useful for
+/// overloaded functions where we want one canonical row in `pg_proc`.
+/// Variadic / `Any` / `VariadicEqual` signatures return `None` because they
+/// do not have a fixed argument list and would produce nonsense
+/// `proargtypes` values.
+fn first_exact_arg_types(sig: &TypeSignature) -> Option<Vec<String>> {
+    match sig {
+        TypeSignature::Exact(types) => Some(
+            types
+                .iter()
+                .map(arrow_util::pretty::fmt_dtype)
+                .map(|d| d.to_string())
+                .collect(),
+        ),
+        TypeSignature::Uniform(arg_count, valid_types) => valid_types.first().map(|t| {
+            std::iter::repeat(arrow_util::pretty::fmt_dtype(t).to_string())
+                .take(*arg_count)
+                .collect()
+        }),
+        TypeSignature::OneOf(sigs) => sigs.iter().find_map(first_exact_arg_types),
+        // Variadic / Any / VariadicEqual / VariadicAny: no fixed list.
+        _ => None,
+    }
 }
