@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use catalog::session_catalog::SessionCatalog;
+use chrono::{DateTime, Utc};
 use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::expr::ScalarFunction;
@@ -15,6 +16,7 @@ use datafusion::logical_expr::{
 use datafusion::physical_plan::ColumnarValue;
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
+use once_cell::sync::Lazy;
 use pgrepr::compatible::server_version_with_build_info;
 use protogen::metastore::types::catalog::FunctionType;
 
@@ -1097,8 +1099,16 @@ impl ConstBuiltinFunction for ColDescription {
     const EXAMPLE: &'static str = "col_description(table_oid, attnum)";
     const FUNCTION_TYPE: FunctionType = FunctionType::Scalar;
     fn signature(&self) -> Option<Signature> {
-        Some(Signature::exact(
-            vec![DataType::Int64, DataType::Int32],
+        // Accept all integer-width combinations so SQL literals (Int64
+        // by default in DataFusion) don't fail coercion against a
+        // narrower oid/integer signature. Mirrors `ObjDescription`.
+        Some(Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Int64, DataType::Int64]),
+                TypeSignature::Exact(vec![DataType::Int64, DataType::Int32]),
+                TypeSignature::Exact(vec![DataType::Int32, DataType::Int64]),
+                TypeSignature::Exact(vec![DataType::Int32, DataType::Int32]),
+            ],
             Volatility::Stable,
         ))
     }
@@ -1275,15 +1285,20 @@ impl BuiltinScalarUDF for PgTypeOidByName {
 }
 
 // ----- pg_postmaster_start_time / pg_conf_load_time --------------------------
-// Stub timestamps fixed at the Unix epoch — DBeaver renders the column but
-// doesn't depend on the value.
+// Captured at first reference (effectively process start, since
+// `BuiltinScalarUDF`s resolve during the first session's planner
+// initialization). Surfaces to `pg_postmaster_start_time()` so DBeaver
+// shows a real "server started at" timestamp in its Properties pane —
+// previously hardcoded to the Unix epoch (1970-01-01).
+static POSTMASTER_START: Lazy<DateTime<Utc>> = Lazy::new(Utc::now);
+
 #[derive(Clone, Copy, Debug)]
 pub struct PgPostmasterStartTime;
 
 impl ConstBuiltinFunction for PgPostmasterStartTime {
     const NAME: &'static str = "pg_postmaster_start_time";
     const DESCRIPTION: &'static str =
-        "Postgres `pg_postmaster_start_time` — when the server started. Stub returns epoch.";
+        "Postgres `pg_postmaster_start_time` — when the server started.";
     const EXAMPLE: &'static str = "pg_postmaster_start_time()";
     const FUNCTION_TYPE: FunctionType = FunctionType::Scalar;
     fn signature(&self) -> Option<Signature> {
@@ -1293,6 +1308,7 @@ impl ConstBuiltinFunction for PgPostmasterStartTime {
 
 impl BuiltinScalarUDF for PgPostmasterStartTime {
     fn try_as_expr(&self, _: &SessionCatalog, args: Vec<Expr>) -> DataFusionResult<Expr> {
+        let micros = POSTMASTER_START.timestamp_micros();
         Ok(simple_const_udf(
             Self::NAME,
             ConstBuiltinFunction::signature(self).unwrap(),
@@ -1300,7 +1316,7 @@ impl BuiltinScalarUDF for PgPostmasterStartTime {
                 datafusion::arrow::datatypes::TimeUnit::Microsecond,
                 Some("UTC".into()),
             ),
-            ScalarValue::TimestampMicrosecond(Some(0), Some("UTC".into())),
+            ScalarValue::TimestampMicrosecond(Some(micros), Some("UTC".into())),
             args,
         ))
     }

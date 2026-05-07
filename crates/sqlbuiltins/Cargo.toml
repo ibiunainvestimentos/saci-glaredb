@@ -23,6 +23,7 @@ parser = { path = "../parser" }
 decimal = { path = "../decimal" }
 async-trait = { workspace = true }
 bytes = { workspace = true }
+chrono = { workspace = true }
 datafusion = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true }

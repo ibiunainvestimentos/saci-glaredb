@@ -1,0 +1,44 @@
+# 25P02 — once a statement errors inside a transaction, every
+# subsequent statement is rejected until ROLLBACK / COMMIT / END /
+# ABORT / RELEASE clears the failed state. Real Postgres behaviour
+# previously not enforced by glaredb (tx_status transitioned correctly
+# but no gate at query() / execute()).
+
+statement ok
+BEGIN;
+
+statement error pgcode 42P01
+SELECT * FROM does_not_exist_table;
+
+# Tx is now in Failed state — every command rejected.
+statement error pgcode 25P02
+SELECT 1;
+
+statement error pgcode 25P02
+SELECT current_database();
+
+# ROLLBACK is the escape hatch.
+statement ok
+ROLLBACK;
+
+# State cleared — normal queries work again.
+query I
+SELECT 1;
+----
+1
+
+# Same with COMMIT in a failed tx (Postgres treats COMMIT-on-failed as
+# an implicit ROLLBACK; either way state should clear).
+statement ok
+BEGIN;
+
+statement error pgcode 42703
+SELECT no_such_column FROM pg_catalog.pg_namespace LIMIT 1;
+
+statement ok
+COMMIT;
+
+query I
+SELECT 1;
+----
+1

@@ -464,6 +464,14 @@ struct ClientSession<C, S> {
     /// Populated at Bind time when the bound statement is a no-op,
     /// consumed at Execute, evicted at Close.
     portal_noop_tags: HashMap<String, &'static str>,
+    /// Original SQL text per prepared statement, populated at Parse and
+    /// evicted at Close. The 25P02 enforcement at `execute()` needs to
+    /// know whether the SQL is a transaction-end command (ROLLBACK /
+    /// COMMIT / END / ABORT / RELEASE) before deciding to gate.
+    stmt_sql: HashMap<String, String>,
+    /// Portal name → statement name. Populated at Bind, evicted at Close.
+    /// Used by `execute()` to look up the statement's SQL text.
+    portal_stmt: HashMap<String, String>,
 }
 
 /// This helper macro is used so we can call some `get_*` methods on the
@@ -495,6 +503,8 @@ where
             tx_status: TransactionStatus::Idle,
             noop_tags: HashMap::new(),
             portal_noop_tags: HashMap::new(),
+            stmt_sql: HashMap::new(),
+            portal_stmt: HashMap::new(),
         }
     }
 
@@ -626,7 +636,24 @@ where
         let num_statements = stmts.len();
 
         for stmt in stmts {
-            // TODO: Ensure in transaction.
+            // 25P02 enforcement (matches real Postgres): once an error
+            // inside a transaction puts the session into Failed, every
+            // subsequent statement is rejected with `InFailedSqlTransaction`
+            // until ROLLBACK / COMMIT / END / ABORT / RELEASE clears the
+            // state. Per-statement check inside the loop so a multi-stmt
+            // simple-query like `SELECT 1; ROLLBACK;` doesn't slip the
+            // gate when the first stmt arrives in failed state.
+            if matches!(self.tx_status, TransactionStatus::Failed)
+                && !ends_failed_transaction(&stmt.to_string())
+            {
+                self.send_error(ErrorResponse::error(
+                    pgrepr::notice::SqlState::InFailedTransaction,
+                    "current transaction is aborted, commands ignored \
+                     until end of transaction block",
+                ))
+                .await?;
+                return self.ready_for_query().await;
+            }
 
             // Note everything is using unnamed portals/prepared statements.
 
@@ -721,6 +748,11 @@ where
             Err(e) => return self.send_error(e).await,
         };
 
+        // Stash the SQL text against the statement name so the 25P02
+        // gate in execute() can decide whether it's a transaction-end
+        // command without re-parsing.
+        self.stmt_sql.insert(name.clone(), sql.clone());
+
         // Connection-housekeeping no-ops in the extended-query flow:
         // record the tag against the statement name, prepare an empty
         // statement (so Bind / Describe / Close all work), and send
@@ -803,6 +835,11 @@ where
             self.portal_noop_tags.insert(portal.clone(), tag);
         }
 
+        // Map portal → statement so execute() can read the SQL text out
+        // of stmt_sql for the 25P02 gate decision.
+        self.portal_stmt
+            .insert(portal.clone(), statement.clone());
+
         match self
             .session
             .bind_statement(portal, &statement, scalars, result_formats)
@@ -868,6 +905,28 @@ where
             return Self::command_complete(&mut self.conn, tag).await;
         }
 
+        // 25P02 enforcement (extended-query path). Same gate as the
+        // simple-query path: reject every statement until ROLLBACK /
+        // COMMIT clears the failed-tx state. Look up the SQL text via
+        // portal → statement → stmt_sql.
+        if matches!(self.tx_status, TransactionStatus::Failed) {
+            let allow = self
+                .portal_stmt
+                .get(&portal)
+                .and_then(|stmt| self.stmt_sql.get(stmt))
+                .map(|sql| ends_failed_transaction(sql))
+                .unwrap_or(false);
+            if !allow {
+                return self
+                    .send_error(ErrorResponse::error(
+                        pgrepr::notice::SqlState::InFailedTransaction,
+                        "current transaction is aborted, commands ignored \
+                         until end of transaction block",
+                    ))
+                    .await;
+            }
+        }
+
         let conn = &mut self.conn;
         let session = &mut self.session;
         let stream = match session.execute_portal(&portal, max_rows).await {
@@ -906,10 +965,12 @@ where
             DescribeObjectType::Statement => {
                 self.session.remove_prepared_statement(&name);
                 self.noop_tags.remove(&name);
+                self.stmt_sql.remove(&name);
             }
             DescribeObjectType::Portal => {
                 self.session.remove_portal(&name);
                 self.portal_noop_tags.remove(&name);
+                self.portal_stmt.remove(&name);
             }
         }
         self.conn.send(BackendMessage::CloseComplete).await
@@ -1129,6 +1190,25 @@ fn is_postgres_noop(sql: &str) -> Option<&'static str> {
         last_tag = Some(match_one(piece)?);
     }
     last_tag
+}
+
+/// True iff `sql`'s first non-whitespace word is one of the keywords
+/// that ends or rolls back a failed transaction (matches Postgres
+/// behavior: in `25P02`, every command is rejected EXCEPT ROLLBACK /
+/// COMMIT / END / ABORT / RELEASE — and even COMMIT silently rolls
+/// back the failed tx).
+fn ends_failed_transaction(sql: &str) -> bool {
+    let first = sql
+        .trim_start()
+        .trim_start_matches(';')
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        first.as_str(),
+        "rollback" | "commit" | "end" | "abort" | "release"
+    )
 }
 
 /// Decodes inputs for a prepared query into the appropriate scalar values.

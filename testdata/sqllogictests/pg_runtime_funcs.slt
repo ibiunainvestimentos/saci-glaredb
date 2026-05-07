@@ -1,0 +1,34 @@
+# Coverage for runtime-introspection scalar UDFs that surface to
+# `whoami` / DBeaver Properties / pgcli session info.
+
+# pg_postmaster_start_time — captured at first reference (effectively
+# process start). Was previously a NULL/epoch stub. Should be a real
+# timestamp in the recent past.
+query B
+SELECT pg_catalog.pg_postmaster_start_time() > CAST('2020-01-01 00:00:00' AS TIMESTAMP);
+----
+true
+
+query B
+SELECT pg_catalog.pg_postmaster_start_time() < CAST('2100-01-01 00:00:00' AS TIMESTAMP);
+----
+true
+
+# Within-session stability — two calls return the same timestamp.
+query B
+SELECT pg_catalog.pg_postmaster_start_time() = pg_catalog.pg_postmaster_start_time();
+----
+true
+
+# pg_is_in_recovery — false stub (we have no replication).
+query B
+SELECT pg_catalog.pg_is_in_recovery();
+----
+false
+
+# pg_backend_pid — wire-level PID lives in BackendKeyData, this UDF is
+# a 0 stub (matches previous behaviour; documented gap).
+query I
+SELECT pg_catalog.pg_backend_pid();
+----
+0

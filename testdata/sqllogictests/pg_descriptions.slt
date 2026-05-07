@@ -1,0 +1,39 @@
+# Coverage for `pg_catalog.col_description` and `pg_catalog.obj_description`
+# scalar UDFs. Both are NULL stubs (saci-backend's `describe_table`
+# sidesteps via direct `pg_description` joins), but they must be CALLABLE
+# without coercion errors so tools like psql `\d+` and DBeaver can use
+# them. The new ColDescription signature accepts all integer-width
+# combinations.
+
+# col_description(table_oid, attnum) — returns NULL stub.
+query T
+SELECT pg_catalog.col_description(0, 1);
+----
+NULL
+
+query T
+SELECT pg_catalog.col_description(CAST(0 AS INT), CAST(1 AS INT));
+----
+NULL
+
+query T
+SELECT pg_catalog.col_description(CAST(0 AS BIGINT), CAST(1 AS BIGINT));
+----
+NULL
+
+# Mixed widths.
+query T
+SELECT pg_catalog.col_description(0, CAST(1 AS INT));
+----
+NULL
+
+query T
+SELECT pg_catalog.col_description(CAST(0 AS INT), 1);
+----
+NULL
+
+# obj_description(oid, classname) — also NULL stub.
+query T
+SELECT pg_catalog.obj_description(0, 'pg_class');
+----
+NULL

@@ -259,6 +259,18 @@ fn classify_sqlstate(msg: &str) -> pgrepr::notice::SqlState {
     use pgrepr::notice::SqlState;
     let lower = msg.to_ascii_lowercase();
 
+    // 22P02 (cast / Arrow conversion) — checked FIRST so a "cast not
+    // supported" wording (which Arrow occasionally emits) hits the
+    // narrower invalid-input class instead of falling through to the
+    // generic 0A000 block below. DataFusion/Arrow framings:
+    //   "Cast error: Cannot cast string '...' to value of Date32"
+    //   "Cannot cast value ... to type ..."
+    if lower.contains("cast error")
+        || (lower.contains("cannot cast") && lower.contains(" to "))
+    {
+        return SqlState::InvalidTextRepresentation;
+    }
+
     // 42P01 — table / view / matview / index not found.
     if lower.contains("table not found")
         || lower.contains("relation not found")
@@ -344,8 +356,12 @@ fn classify_sqlstate(msg: &str) -> pgrepr::notice::SqlState {
         return SqlState::TooManyConnections;
     }
 
-    // 0A000 — feature not supported.
+    // 0A000 — feature not supported. The "does not support" branch
+    // catches DataFusion errors like "Execution error: LIKE does not
+    // support escape_char" that the bare "not supported" pattern
+    // misses (the actual message uses the present-tense "support").
     if lower.contains("not supported")
+        || lower.contains("does not support")
         || lower.contains("unsupported")
         || lower.contains("not yet implemented")
     {
@@ -358,8 +374,15 @@ fn classify_sqlstate(msg: &str) -> pgrepr::notice::SqlState {
         return SqlState::SyntaxError;
     }
 
-    // 42P07 — duplicate object.
-    if lower.contains("already exists") {
+    // 42P07 — duplicate object. Catches both the canonical "already
+    // exists" wording and glaredb's catalog-side framing for duplicate
+    // CREATE statements which surfaces as "Catalog error: failed to
+    // create schema/table".
+    if lower.contains("already exists")
+        || (lower.contains("catalog error")
+            && lower.contains("failed to create")
+            && (lower.contains("schema") || lower.contains("table")))
+    {
         return SqlState::DuplicateTable;
     }
 

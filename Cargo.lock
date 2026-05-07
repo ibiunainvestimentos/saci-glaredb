@@ -8345,6 +8345,7 @@ dependencies = [
  "bson",
  "bytes",
  "catalog",
+ "chrono",
  "datafusion",
  "datafusion-functions-array",
  "datafusion_ext",

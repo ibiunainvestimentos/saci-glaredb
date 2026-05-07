@@ -1,0 +1,45 @@
+# Coverage for the sqlstate classifier in `pgsrv/src/messages.rs`.
+# Each assertion triggers a specific error class and confirms the
+# emitted PG sqlstate code is the one downstream drivers (asyncpg,
+# JDBC, sacibackend's classify_sqlstate) expect.
+
+# 42P01 — table not found
+statement error pgcode 42P01
+SELECT * FROM no_such_schema.no_such_table;
+
+# 42703 — column not found
+statement error pgcode 42703
+SELECT does_not_exist FROM pg_catalog.pg_class LIMIT 1;
+
+# 42883 — function not found
+statement error pgcode 42883
+SELECT no_such_function(1);
+
+# 22P02 — invalid input syntax / cast error
+# Covers the new "cast error" / "cannot cast ... to" pattern added to
+# classify_sqlstate. Was emitting XX000 (InternalError) before the fix.
+statement error pgcode 22P02
+SELECT CAST('not-a-date' AS DATE);
+
+# 0A000 — feature not supported
+# Covers the "does not support" extension to the existing 0A000 block.
+# DataFusion errors with "LIKE does not support escape_char" on this.
+statement error pgcode 0A000
+SELECT 'a' LIKE 'a' ESCAPE '\';
+
+# 42P07 — duplicate object
+# Covers the new catalog-error pattern that catches glaredb's framing
+# of "Catalog error: failed to create schema" on a duplicate CREATE.
+statement ok
+CREATE SCHEMA classifier_test_schema;
+
+statement error pgcode 42P07
+CREATE SCHEMA classifier_test_schema;
+
+statement ok
+DROP SCHEMA classifier_test_schema;
+
+# 42601 — syntax error (caught upstream at parse_sql, not by
+# classify_sqlstate; included for coverage completeness).
+statement error pgcode 42601
+SELECT FROM WHERE;
