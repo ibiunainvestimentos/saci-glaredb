@@ -130,7 +130,19 @@ impl PgCodec {
         match version {
             VERSION_V3 => (), // Continue with normal startup flow.
             VERSION_SSL => return Ok(StartupMessage::SSLRequest { version }),
-            VERSION_CANCEL => return Ok(StartupMessage::CancelRequest { version }),
+            VERSION_CANCEL => {
+                // Cancel-request payload is `(process_id, secret_key)` —
+                // both i32 — sent on a fresh TCP connection. Both ids are
+                // zero in malformed clients; let the handler decide what
+                // to do with them.
+                let process_id = conn.read_i32().await?;
+                let secret_key = conn.read_i32().await?;
+                return Ok(StartupMessage::CancelRequest {
+                    version,
+                    process_id,
+                    secret_key,
+                });
+            }
             other => return Err(PgSrvError::InvalidProtocolVersion(other)),
         }
 
@@ -287,6 +299,7 @@ impl Encoder<BackendMessage> for PgCodec {
             BackendMessage::CloseComplete => b'3',
             BackendMessage::NoData => b'n',
             BackendMessage::ParameterDescription(_) => b't',
+            BackendMessage::BackendKeyData { .. } => b'K',
         };
         dst.put_u8(byte);
 
@@ -386,6 +399,13 @@ impl Encoder<BackendMessage> for PgCodec {
                 for desc in descs.into_iter() {
                     dst.put_i32(desc);
                 }
+            }
+            BackendMessage::BackendKeyData {
+                process_id,
+                secret_key,
+            } => {
+                dst.put_i32(process_id);
+                dst.put_i32(secret_key);
             }
         }
 

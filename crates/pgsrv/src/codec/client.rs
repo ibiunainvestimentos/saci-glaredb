@@ -105,8 +105,19 @@ impl Encoder<StartupMessage> for PgClientCodec {
 
                 Ok(())
             }
-            StartupMessage::CancelRequest { version: _ } => {
-                todo!("encode<StartupMessage::CancelRequest>")
+            StartupMessage::CancelRequest {
+                version,
+                process_id,
+                secret_key,
+            } => {
+                // Cancel request payload: 16 bytes total — length, version,
+                // process_id, secret_key. The length includes itself and
+                // the version (4+4+4+4 = 16).
+                dst.put_i32(16);
+                dst.put_i32(version);
+                dst.put_i32(process_id);
+                dst.put_i32(secret_key);
+                Ok(())
             }
         }
     }

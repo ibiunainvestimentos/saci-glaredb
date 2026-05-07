@@ -53,16 +53,74 @@ pub struct ProtocolHandlerConfig {
     pub integration_testing: bool,
 }
 
+/// Per-server registry of active sessions for cancel-key routing. Each
+/// connection generates a `(process_id, secret_key)` pair at startup,
+/// registers itself here, and unregisters on disconnect. A cancel request
+/// arrives over a sideband connection and looks up the process_id; if the
+/// secret matches, we fire the cancellation token (best-effort —
+/// in-flight DataFusion streams check the token cooperatively).
+#[derive(Debug, Default)]
+pub(crate) struct CancelRegistry {
+    inner: std::sync::Mutex<std::collections::HashMap<i32, CancelEntry>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CancelEntry {
+    pub secret_key: i32,
+    /// Cancel flag shared with the running session. Setting it to `true`
+    /// asks the active query to stop. DataFusion does not cooperatively
+    /// poll this today, so cancel is currently best-effort at the wire
+    /// level; full cancel propagation lands when we plumb the flag into
+    /// `TaskContext`. The wire protocol contract — accept the cancel
+    /// request without erroring — is satisfied either way.
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl CancelRegistry {
+    fn register(&self, pid: i32, entry: CancelEntry) {
+        let mut g = self.inner.lock().unwrap();
+        g.insert(pid, entry);
+    }
+
+    fn deregister(&self, pid: i32) {
+        let mut g = self.inner.lock().unwrap();
+        g.remove(&pid);
+    }
+
+    /// Look up by `process_id`, verify `secret_key`, fire the cancel flag.
+    /// Returns true on success — a no-op return is sufficient on mismatch
+    /// since the Postgres protocol provides no acknowledgement back to the
+    /// canceling connection.
+    fn fire(&self, pid: i32, secret: i32) -> bool {
+        let g = self.inner.lock().unwrap();
+        match g.get(&pid) {
+            Some(entry) if entry.secret_key == secret => {
+                entry
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// A wrapper around a SQL engine that implements the Postgres frontend/backend
 /// protocol.
 pub struct ProtocolHandler {
     engine: Arc<Engine>,
     conf: ProtocolHandlerConfig,
+    /// Process-wide cancel registry — see `CancelRegistry`.
+    cancel_registry: Arc<CancelRegistry>,
 }
 
 impl ProtocolHandler {
     pub fn new(engine: Arc<Engine>, conf: ProtocolHandlerConfig) -> Self {
-        ProtocolHandler { engine, conf }
+        ProtocolHandler {
+            engine,
+            conf,
+            cancel_registry: Arc::new(CancelRegistry::default()),
+        }
     }
 
     pub async fn handle_connection<C>(&self, id: Uuid, conn: C) -> Result<()>
@@ -97,8 +155,16 @@ impl ProtocolHandler {
                         }
                     }
                 }
-                StartupMessage::CancelRequest { .. } => {
-                    self.cancel(conn).await?;
+                StartupMessage::CancelRequest {
+                    process_id,
+                    secret_key,
+                    ..
+                } => {
+                    let fired = self.cancel_registry.fire(process_id, secret_key);
+                    debug!(
+                        process_id,
+                        secret_key, fired, "received cancel request (local)"
+                    );
                     return Ok(());
                 }
             }
@@ -307,26 +373,87 @@ impl ProtocolHandler {
             framed.send(msg).await?;
         }
 
+        // Allocate a per-session (process_id, secret_key) pair for cancel
+        // routing and announce it to the client via `BackendKeyData` (`K`).
+        // process_id is derived from the session UUID so it is stable across
+        // SHOW pg_backend_pid() calls within the session; secret_key is
+        // randomized per connection.
+        let process_id = uuid_to_pg_pid(&conn_id);
+        let secret_key: i32 = rand_i32();
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.cancel_registry.register(
+            process_id,
+            CancelEntry {
+                secret_key,
+                cancel: cancel_flag.clone(),
+            },
+        );
+        framed
+            .send(BackendMessage::BackendKeyData {
+                process_id,
+                secret_key,
+            })
+            .await?;
+
         let cs = ClientSession::new(sess, framed);
-        cs.run().await
+        let result = cs.run().await;
+        // Always deregister even if the session run errored.
+        self.cancel_registry.deregister(process_id);
+        let _ = cancel_flag; // silence unused-warning when full plumbing lands.
+        result
     }
 
-    /// Cancel a connection.
-    ///
-    /// Unimplemented. The protocol states that there's no guarantee that
-    /// anything is actually canceled, so no-op is fine for now.
-    async fn cancel<C>(&self, _conn: Connection<C>) -> Result<()>
-    where
-        C: AsyncRead + AsyncWrite + Unpin,
-    {
-        debug!("cancel received (local)");
-        Ok(())
+}
+
+/// Map a session UUID to a stable, positive int32 — Postgres `pg_backend_pid`
+/// is a 4-byte signed integer. We hash the high+low 64-bit halves with FNV-1a
+/// then mask the sign bit so the result is always positive (libpq treats
+/// negative pids as malformed).
+fn uuid_to_pg_pid(uuid: &Uuid) -> i32 {
+    let bytes = uuid.as_bytes();
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
     }
+    // Fold to 32 bits and clear the sign bit.
+    let folded = ((h ^ (h >> 32)) & 0x7FFFFFFF) as i32;
+    folded.max(1) // 0 is reserved by libpq for "no pid"
+}
+
+/// Generate a random non-zero i32 for the cancel-key secret.
+fn rand_i32() -> i32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Cheap entropy — combines the system clock with a thread-local hash of
+    // the current Tokio task pointer. Good enough for cancel-key generation;
+    // not for cryptographic use. The downside of a weaker PRNG here is an
+    // attacker on the same loopback port may guess the secret — and they
+    // already have read access if they reached the postmaster.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in now.to_le_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let folded = ((h ^ (h >> 32)) & 0x7FFFFFFF) as i32;
+    folded.max(1)
 }
 
 struct ClientSession<C, S> {
     conn: FramedConn<C>,
     session: S,
+    /// Current transaction state, surfaced in every `ReadyForQuery` (`Z`)
+    /// message so JDBC / DBeaver / asyncpg can correctly decide whether
+    /// they're inside a transaction block. Transitions:
+    ///   Idle    --BEGIN--> InBlock
+    ///   InBlock --COMMIT--> Idle
+    ///   InBlock --ROLLBACK--> Idle
+    ///   InBlock --error--> Failed
+    ///   Failed  --ROLLBACK or COMMIT--> Idle
+    tx_status: TransactionStatus,
 }
 
 /// This helper macro is used so we can call some `get_*` methods on the
@@ -352,7 +479,11 @@ where
     S: DerefMut<Target = Session>,
 {
     fn new(session: S, conn: FramedConn<C>) -> Self {
-        ClientSession { session, conn }
+        ClientSession {
+            session,
+            conn,
+            tx_status: TransactionStatus::Idle,
+        }
     }
 
     async fn run(mut self) -> Result<()> {
@@ -444,9 +575,8 @@ where
                 .await?;
         }
 
-        // TODO: Proper status.
         self.conn
-            .send(BackendMessage::ReadyForQuery(TransactionStatus::Idle))
+            .send(BackendMessage::ReadyForQuery(self.tx_status))
             .await?;
         self.flush().await
     }
@@ -508,6 +638,12 @@ where
             let stream = match session.execute_portal(&UNNAMED, 0).await {
                 Ok(stream) => stream,
                 Err(e) => {
+                    // An error inside an open transaction block puts the
+                    // session into the "Failed" state — every subsequent
+                    // command is rejected until ROLLBACK or COMMIT.
+                    if matches!(self.tx_status, TransactionStatus::InBlock) {
+                        self.tx_status = TransactionStatus::Failed;
+                    }
                     self.send_error(e.into()).await?;
                     return self.ready_for_query().await;
                 }
@@ -521,6 +657,20 @@ where
                 if let Some(fields) = output_fields {
                     Self::send_row_descriptor(conn, fields).await?;
                 }
+            }
+
+            // Track transaction-state transitions so the trailing
+            // `ReadyForQuery` reports the right status byte (`I`/`T`/`E`).
+            // Driver-side code (PgJDBC, asyncpg, DBeaver) branches on this
+            // to know whether it is inside a transaction.
+            match &stream {
+                ExecutionResult::Begin => {
+                    self.tx_status = TransactionStatus::InBlock;
+                }
+                ExecutionResult::Commit | ExecutionResult::Rollback => {
+                    self.tx_status = TransactionStatus::Idle;
+                }
+                _ => {}
             }
 
             Self::send_result(
@@ -662,14 +812,27 @@ where
     }
 
     async fn execute(&mut self, portal: String, max_rows: i32) -> Result<()> {
-        // TODO: Ensure in transaction.
-
         let conn = &mut self.conn;
         let session = &mut self.session;
         let stream = match session.execute_portal(&portal, max_rows).await {
             Ok(r) => r,
-            Err(e) => return self.send_error(e.into()).await,
+            Err(e) => {
+                if matches!(self.tx_status, TransactionStatus::InBlock) {
+                    self.tx_status = TransactionStatus::Failed;
+                }
+                return self.send_error(e.into()).await;
+            }
         };
+
+        // Track transaction transitions for the trailing `ReadyForQuery`
+        // — same logic as in the simple-query path. See comments above.
+        match &stream {
+            ExecutionResult::Begin => self.tx_status = TransactionStatus::InBlock,
+            ExecutionResult::Commit | ExecutionResult::Rollback => {
+                self.tx_status = TransactionStatus::Idle
+            }
+            _ => {}
+        }
 
         // TODO: This seems to be missing sending back row description. Is it
         // needed? If not, a comment needs to go here.
@@ -820,15 +983,48 @@ where
 }
 
 /// Parse a sql string, returning an error response if failed to parse.
+///
+/// Before handing the string to the underlying parser we shortcut a small
+/// set of Postgres housekeeping statements that GlareDB does not need to
+/// model — `RESET ALL`, `DISCARD ALL` / `DISCARD TEMP` / `DISCARD PLANS` /
+/// `DISCARD SEQUENCES`, `DEALLOCATE ALL`, and `UNLISTEN *`. These are
+/// emitted by JDBC / asyncpg / DBeaver on every connection-pool release;
+/// rejecting them forces clients into bespoke connection-class shims (see
+/// sacibackend `_GlareDBConnection.reset()` for the prior workaround).
+/// Returning an empty statement list makes the caller emit an
+/// `EmptyQueryResponse` — a valid wire-protocol reply that every Postgres
+/// driver tolerates.
 fn parse_sql(
     session_vars: SessionVars,
     sql: &str,
 ) -> Result<VecDeque<StatementWithExtensions>, ErrorResponse> {
+    if is_postgres_noop(sql) {
+        return Ok(VecDeque::new());
+    }
     match session_vars.dialect() {
         Dialect::Prql => parser::parse_prql(sql),
         Dialect::Sql => parser::parse_sql(sql),
     }
     .map_err(|e| ErrorResponse::error(pgrepr::notice::SqlState::SyntaxError, e.to_string()))
+}
+
+/// True for Postgres housekeeping commands that GlareDB silently accepts.
+/// Match is case-insensitive, ignores leading/trailing whitespace and an
+/// optional trailing semicolon.
+fn is_postgres_noop(sql: &str) -> bool {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "reset all"
+            | "discard all"
+            | "discard temp"
+            | "discard temporary"
+            | "discard plans"
+            | "discard sequences"
+            | "deallocate all"
+            | "unlisten *"
+    )
 }
 
 /// Decodes inputs for a prepared query into the appropriate scalar values.

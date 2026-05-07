@@ -5,7 +5,13 @@ use crate::error::PgReprError;
 
 /// 'SQLSTATE' error codes.
 ///
-/// See a complete list here: https://www.postgresql.org/docs/current/errcodes-appendix.html
+/// Drivers and tools (DBeaver, JDBC, asyncpg, libpq) branch on these to
+/// distinguish "table not found" from "auth failure" from "operator timeout"
+/// — coarse `XX000` everywhere makes them treat every error as a fatal
+/// internal one and abort retries / reconnect strategies.
+///
+/// See the complete list at
+/// <https://www.postgresql.org/docs/current/errcodes-appendix.html>.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqlState {
     // Class 00 — Successful Completion
@@ -17,8 +23,62 @@ pub enum SqlState {
     // Class 0A — Feature Not Supported
     FeatureNotSupported,
 
+    // Class 22 — Data Exception
+    /// 22P02 — invalid text representation (e.g. malformed timestamp string).
+    InvalidTextRepresentation,
+    /// 22008 — datetime field overflow.
+    DatetimeFieldOverflow,
+    /// 22023 — invalid parameter value.
+    InvalidParameterValue,
+
+    // Class 25 — Invalid Transaction State
+    /// 25P02 — current transaction is aborted, commands ignored until end.
+    InFailedTransaction,
+
+    // Class 28 — Invalid Authorization Specification
+    /// 28P01 — invalid password.
+    InvalidPassword,
+    /// 28000 — invalid authorization specification.
+    InvalidAuth,
+
+    // Class 3D — Invalid Catalog Name
+    /// 3D000 — database does not exist.
+    DatabaseDoesNotExist,
+
+    // Class 3F — Invalid Schema Name
+    /// 3F000 — schema does not exist.
+    SchemaDoesNotExist,
+
     // Class 42 — Syntax Error or Access Rule Violation
+    /// 42601 — syntax error.
     SyntaxError,
+    /// 42P01 — undefined table / view / matview / index.
+    UndefinedTable,
+    /// 42703 — undefined column.
+    UndefinedColumn,
+    /// 42883 — undefined function (also covers undefined operator).
+    UndefinedFunction,
+    /// 42704 — undefined object (catch-all for missing schema-qualified
+    /// references).
+    UndefinedObject,
+    /// 42P02 — undefined parameter.
+    UndefinedParameter,
+    /// 42501 — insufficient privilege.
+    InsufficientPrivilege,
+    /// 42P07 — duplicate table.
+    DuplicateTable,
+
+    // Class 53 — Insufficient Resources
+    /// 53300 — too many connections.
+    TooManyConnections,
+    /// 53400 — configuration limit exceeded.
+    ConfigurationLimitExceeded,
+
+    // Class 57 — Operator Intervention
+    /// 57014 — query canceled (used by `pg_cancel_backend` / statement timeout).
+    QueryCanceled,
+    /// 57P01 — admin shutdown.
+    AdminShutdown,
 
     // Class XX — Internal Error
     InternalError,
@@ -30,7 +90,26 @@ impl SqlState {
             SqlState::Successful => "00000",
             SqlState::Warning => "01000",
             SqlState::FeatureNotSupported => "0A000",
+            SqlState::InvalidTextRepresentation => "22P02",
+            SqlState::DatetimeFieldOverflow => "22008",
+            SqlState::InvalidParameterValue => "22023",
+            SqlState::InFailedTransaction => "25P02",
+            SqlState::InvalidPassword => "28P01",
+            SqlState::InvalidAuth => "28000",
+            SqlState::DatabaseDoesNotExist => "3D000",
+            SqlState::SchemaDoesNotExist => "3F000",
             SqlState::SyntaxError => "42601",
+            SqlState::UndefinedTable => "42P01",
+            SqlState::UndefinedColumn => "42703",
+            SqlState::UndefinedFunction => "42883",
+            SqlState::UndefinedObject => "42704",
+            SqlState::UndefinedParameter => "42P02",
+            SqlState::InsufficientPrivilege => "42501",
+            SqlState::DuplicateTable => "42P07",
+            SqlState::TooManyConnections => "53300",
+            SqlState::ConfigurationLimitExceeded => "53400",
+            SqlState::QueryCanceled => "57014",
+            SqlState::AdminShutdown => "57P01",
             SqlState::InternalError => "XX000",
         }
     }

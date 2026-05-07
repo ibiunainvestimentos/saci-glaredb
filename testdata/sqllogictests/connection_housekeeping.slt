@@ -1,0 +1,33 @@
+# Postgres connection-housekeeping commands. asyncpg / JDBC / DBeaver emit
+# these on every pool release and during driver introspection. GlareDB
+# accepts them as no-ops so clients don't need bespoke connection-class
+# shims (see sacibackend `_GlareDBConnection.reset()` workaround for the
+# prior pain point).
+
+statement ok
+RESET ALL;
+
+statement ok
+DISCARD ALL;
+
+statement ok
+DISCARD TEMP;
+
+statement ok
+DISCARD PLANS;
+
+statement ok
+DISCARD SEQUENCES;
+
+statement ok
+DEALLOCATE ALL;
+
+statement ok
+UNLISTEN *;
+
+# Whitespace / casing variations.
+statement ok
+   reset all   ;
+
+statement ok
+DiScArD aLl;

@@ -22,8 +22,14 @@ pub enum StartupMessage {
     SSLRequest {
         version: i32,
     },
+    /// Postgres cancel request — sent over a *separate* TCP connection to
+    /// kill an in-flight query on another connection. The payload is the
+    /// `(process_id, secret_key)` pair that the server sent in the
+    /// `BackendKeyData` message at connect time.
     CancelRequest {
         version: i32,
+        process_id: i32,
+        secret_key: i32,
     },
     StartupRequest {
         version: i32,
@@ -127,7 +133,7 @@ impl FrontendMessage {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionStatus {
     Idle,
     InBlock,
@@ -151,6 +157,11 @@ pub enum BackendMessage {
     CloseComplete,
     NoData,
     ParameterDescription(Vec<i32>),
+    /// `BackendKeyData` ('K') — sent during startup so the client can later
+    /// issue a `CancelRequest` on a sideband TCP connection. The two ints
+    /// must travel back unchanged in the cancel request and the server's
+    /// session-registry must be able to look the pair up.
+    BackendKeyData { process_id: i32, secret_key: i32 },
 }
 
 impl From<ErrorResponse> for BackendMessage {
@@ -217,23 +228,142 @@ impl ErrorResponse {
 
 impl From<ExecError> for ErrorResponse {
     fn from(e: ExecError) -> Self {
-        // TODO: Actually set appropriate codes.
-        ErrorResponse::error_internal(e.to_string())
+        let msg = e.to_string();
+        ErrorResponse::error(classify_sqlstate(&msg), msg)
     }
 }
 
 impl From<&PgSrvError> for ErrorResponse {
     fn from(e: &PgSrvError) -> Self {
-        // TODO: Actually set appropriate codes.
-        ErrorResponse::error_internal(e.to_string())
+        let msg = e.to_string();
+        ErrorResponse::error(classify_sqlstate(&msg), msg)
     }
 }
 
 impl From<PgReprError> for ErrorResponse {
     fn from(e: PgReprError) -> Self {
-        // TODO: Actually set appropriate codes.
-        ErrorResponse::error_internal(e.to_string())
+        let msg = e.to_string();
+        ErrorResponse::error(classify_sqlstate(&msg), msg)
     }
+}
+
+/// Inspect an error message and pick the best-matching Postgres SQLSTATE
+/// from `pgrepr::notice::SqlState`. Drivers (DBeaver / JDBC / asyncpg /
+/// libpq) branch heavily on these codes — for example, JDBC retries on
+/// `57014` (query canceled) but not on `XX000` (internal). Sending the
+/// right code matters more than the message text.
+///
+/// The matcher errs on the side of preserving `InternalError` when no
+/// signal is present — a wrong specific code is worse than a generic one.
+fn classify_sqlstate(msg: &str) -> pgrepr::notice::SqlState {
+    use pgrepr::notice::SqlState;
+    let lower = msg.to_ascii_lowercase();
+
+    // 42P01 — table / view / matview / index not found.
+    if lower.contains("table not found")
+        || lower.contains("relation not found")
+        || lower.contains("table or view not found")
+        || lower.contains("does not exist")
+            && (lower.contains("table") || lower.contains("relation") || lower.contains("view"))
+        || lower.contains("no table named")
+        || lower.contains("missing builtin table")
+        || lower.contains("unable to fetch table provider")
+    {
+        return SqlState::UndefinedTable;
+    }
+
+    // 42703 — column not found.
+    if lower.contains("column not found")
+        || lower.contains("no field named")
+        || lower.contains("no column")
+        || (lower.contains("does not exist") && lower.contains("column"))
+    {
+        return SqlState::UndefinedColumn;
+    }
+
+    // 42883 — function not found.
+    if lower.contains("function not found")
+        || (lower.contains("does not exist") && lower.contains("function"))
+        || lower.contains("invalid function")
+    {
+        return SqlState::UndefinedFunction;
+    }
+
+    // 3D000 — database not found.
+    if lower.contains("database not found")
+        || (lower.contains("does not exist") && lower.contains("database"))
+    {
+        return SqlState::DatabaseDoesNotExist;
+    }
+
+    // 3F000 — schema not found.
+    if lower.contains("schema not found")
+        || (lower.contains("does not exist") && lower.contains("schema"))
+        || lower.contains("missing schema")
+    {
+        return SqlState::SchemaDoesNotExist;
+    }
+
+    // 28P01 / 28000 — auth.
+    if lower.contains("invalid password") || lower.contains("authentication failed") {
+        return SqlState::InvalidPassword;
+    }
+    if lower.contains("not authorized") || lower.contains("authorization") {
+        return SqlState::InvalidAuth;
+    }
+
+    // 42501 — insufficient privilege.
+    if lower.contains("permission denied") || lower.contains("insufficient privilege") {
+        return SqlState::InsufficientPrivilege;
+    }
+
+    // 22P02 — invalid text representation.
+    if lower.contains("invalid input syntax")
+        || lower.contains("could not parse")
+        || lower.contains("parse error")
+        || lower.contains("invalid value for")
+    {
+        return SqlState::InvalidTextRepresentation;
+    }
+
+    // 22023 — invalid parameter value.
+    if lower.contains("invalid parameter value") {
+        return SqlState::InvalidParameterValue;
+    }
+
+    // 57014 — query canceled (statement_timeout, pg_cancel_backend).
+    if lower.contains("query canceled")
+        || lower.contains("statement timeout")
+        || lower.contains("execution canceled")
+    {
+        return SqlState::QueryCanceled;
+    }
+
+    // 53300 — too many connections.
+    if lower.contains("too many connections") || lower.contains("connection limit") {
+        return SqlState::TooManyConnections;
+    }
+
+    // 0A000 — feature not supported.
+    if lower.contains("not supported")
+        || lower.contains("unsupported")
+        || lower.contains("not yet implemented")
+    {
+        return SqlState::FeatureNotSupported;
+    }
+
+    // 42601 — syntax. (Parser-level errors fire SyntaxError directly upstream;
+    // catch a few common shapes that surface as ExecError via DataFusion.)
+    if lower.contains("syntax error") || lower.contains("expected") && lower.contains("found") {
+        return SqlState::SyntaxError;
+    }
+
+    // 42P07 — duplicate object.
+    if lower.contains("already exists") {
+        return SqlState::DuplicateTable;
+    }
+
+    SqlState::InternalError
 }
 
 #[derive(Debug)]

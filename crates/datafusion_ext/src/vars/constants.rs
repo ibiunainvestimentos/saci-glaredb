@@ -11,6 +11,61 @@ pub(super) const SERVER_VERSION: ServerVar<str> = ServerVar {
     description: "Version of the server",
 };
 
+/// Numeric form of `server_version`. JDBC / DBeaver branch on this
+/// (`server_version_num >= 90100`, `>= 140000`, etc.) to enable
+/// version-specific code paths (partitioning, generated columns, etc.).
+/// Reported alongside `server_version` in the startup ParameterStatus.
+pub(super) const SERVER_VERSION_NUM: ServerVar<str> = ServerVar {
+    name: "server_version_num",
+    // Mirror `pgrepr::compatible::server_version()` (currently 15.1).
+    // Encoded as MMmm00 — 15.1 → 150001 — matching upstream PostgreSQL's
+    // `server_version_num` GUC format.
+    value: "150001",
+    group: "postgres",
+    user_configurable: false,
+    description: "Numeric form of server_version (MMmm00).",
+};
+
+pub(super) const SERVER_ENCODING: ServerVar<str> = ServerVar {
+    name: "server_encoding",
+    value: "UTF8",
+    group: "postgres",
+    user_configurable: false,
+    description: "Server-side text encoding",
+};
+
+pub(super) const IS_SUPERUSER: ServerVar<str> = ServerVar {
+    name: "is_superuser",
+    value: "off",
+    group: "postgres",
+    user_configurable: false,
+    description: "Whether the current session user is a superuser (always off — GlareDB has no privilege model).",
+};
+
+pub(super) const SESSION_AUTHORIZATION: ServerVar<str> = ServerVar {
+    name: "session_authorization",
+    value: "glaredb",
+    group: "postgres",
+    user_configurable: true,
+    description: "Session authorization role name (no enforcement)",
+};
+
+pub(super) const INTERVAL_STYLE: ServerVar<str> = ServerVar {
+    name: "IntervalStyle",
+    value: "postgres",
+    group: "postgres",
+    user_configurable: true,
+    description: "Interval display style",
+};
+
+pub(super) const INTEGER_DATETIMES: ServerVar<str> = ServerVar {
+    name: "integer_datetimes",
+    value: "on",
+    group: "postgres",
+    user_configurable: false,
+    description: "Whether timestamps use 64-bit integer representation (always on).",
+};
+
 pub(super) const APPLICATION_NAME: ServerVar<str> = ServerVar {
     name: "application_name",
     value: "",
@@ -53,10 +108,13 @@ pub(super) const TIMEZONE: ServerVar<str> = ServerVar {
 
 pub(super) const DATESTYLE: ServerVar<str> = ServerVar {
     name: "DateStyle",
-    value: "ISO",
+    // Postgres default — `<output style>, <day-month order>`. DBeaver and
+    // PgJDBC parse this string at startup; bare `ISO` confused some
+    // versions, the full `ISO, MDY` form is what real Postgres reports.
+    value: "ISO, MDY",
     group: "postgres",
     user_configurable: true,
-    description: "Date style of the client, default ISO",
+    description: "Date style of the client, default 'ISO, MDY'",
 };
 
 pub(super) const TRANSACTION_ISOLATION: ServerVar<str> = ServerVar {

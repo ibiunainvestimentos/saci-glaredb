@@ -1,0 +1,79 @@
+# Tests for the Postgres-compat session variables exposed at connect time.
+# Drivers (PgJDBC, asyncpg, DBeaver) read these from `ParameterStatus` and
+# also via `SHOW <name>`; both code paths must agree.
+
+query T
+SHOW server_version;
+----
+15.1
+
+query T
+SHOW server_version_num;
+----
+150001
+
+query T
+SHOW server_encoding;
+----
+UTF8
+
+query T
+SHOW client_encoding;
+----
+UTF8
+
+query T
+SHOW is_superuser;
+----
+off
+
+query T
+SHOW session_authorization;
+----
+glaredb
+
+query T
+SHOW IntervalStyle;
+----
+postgres
+
+query T
+SHOW integer_datetimes;
+----
+on
+
+query T
+SHOW DateStyle;
+----
+ISO, MDY
+
+query T
+SHOW standard_conforming_strings;
+----
+true
+
+# `SET session authorization` should be accepted (no-op enforcement; we just
+# stash the value so DBeaver / JDBC can read it back).
+statement ok
+SET session_authorization TO 'mlucas';
+
+query T
+SHOW session_authorization;
+----
+mlucas
+
+# Reset back so subsequent tests see the default.
+statement ok
+SET session_authorization TO 'glaredb';
+
+# `SET IntervalStyle` should round-trip too.
+statement ok
+SET IntervalStyle TO 'iso_8601';
+
+query T
+SHOW IntervalStyle;
+----
+iso_8601
+
+statement ok
+SET IntervalStyle TO 'postgres';

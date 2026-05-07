@@ -25,14 +25,20 @@ use super::constants::{
     EXTRA_FLOAT_DIGITS,
     FORCE_CATALOG_REFRESH,
     GLAREDB_VERSION,
+    INTEGER_DATETIMES,
+    INTERVAL_STYLE,
     IS_CLOUD_INSTANCE,
+    IS_SUPERUSER,
     MAX_CREDENTIALS_COUNT,
     MAX_DATASOURCE_COUNT,
     MAX_TUNNEL_COUNT,
     MEMORY_LIMIT_BYTES,
     REMOTE_SESSION_ID,
     SEARCH_PATH,
+    SERVER_ENCODING,
     SERVER_VERSION,
+    SERVER_VERSION_NUM,
+    SESSION_AUTHORIZATION,
     STANDARD_CONFORMING_STRINGS,
     STATEMENT_TIMEOUT,
     TIMEZONE,
@@ -54,6 +60,18 @@ pub enum Dialect {
 #[derive(Debug)]
 pub struct SessionVarsInner {
     pub server_version: SessionVar<str>,
+    /// Numeric form of `server_version` — JDBC / DBeaver branch on this.
+    pub server_version_num: SessionVar<str>,
+    /// Server-side text encoding (always UTF8).
+    pub server_encoding: SessionVar<str>,
+    /// `is_superuser` — always 'off' since GlareDB has no role privileges.
+    pub is_superuser: SessionVar<str>,
+    /// Session authorization role name (no enforcement).
+    pub session_authorization: SessionVar<str>,
+    /// Interval display style (default 'postgres').
+    pub interval_style: SessionVar<str>,
+    /// Whether timestamps use 64-bit integer rep (always 'on').
+    pub integer_datetimes: SessionVar<str>,
     pub application_name: SessionVar<str>,
     pub client_encoding: SessionVar<str>,
     pub extra_floating_digits: SessionVar<i32>,
@@ -83,13 +101,24 @@ pub struct SessionVarsInner {
 }
 
 impl SessionVarsInner {
-    /// Return an iterator to the variables that should be sent to the client on
-    /// session start.
+    /// Return an iterator to the variables that should be sent to the client
+    /// on session start as `ParameterStatus` messages. Real Postgres emits
+    /// roughly a dozen of these so JDBC / DBeaver / drivers can branch on
+    /// version, encoding, datestyle etc. without an extra round-trip.
     pub fn startup_vars_iter(&self) -> impl Iterator<Item = &dyn AnyVar> {
-        let vars: [&dyn AnyVar; 3] = [
+        let vars: [&dyn AnyVar; 12] = [
             &self.server_version,
-            &self.application_name,
+            &self.server_version_num,
+            &self.server_encoding,
             &self.client_encoding,
+            &self.application_name,
+            &self.is_superuser,
+            &self.session_authorization,
+            &self.datestyle,
+            &self.interval_style,
+            &self.timezone,
+            &self.integer_datetimes,
+            &self.standard_conforming_strings,
         ];
         vars.into_iter()
     }
@@ -98,6 +127,18 @@ impl SessionVarsInner {
     pub fn get(&self, name: &str) -> datafusion::error::Result<&dyn AnyVar> {
         if name.eq_ignore_ascii_case(SERVER_VERSION.name) {
             Ok(&self.server_version)
+        } else if name.eq_ignore_ascii_case(SERVER_VERSION_NUM.name) {
+            Ok(&self.server_version_num)
+        } else if name.eq_ignore_ascii_case(SERVER_ENCODING.name) {
+            Ok(&self.server_encoding)
+        } else if name.eq_ignore_ascii_case(IS_SUPERUSER.name) {
+            Ok(&self.is_superuser)
+        } else if name.eq_ignore_ascii_case(SESSION_AUTHORIZATION.name) {
+            Ok(&self.session_authorization)
+        } else if name.eq_ignore_ascii_case(INTERVAL_STYLE.name) {
+            Ok(&self.interval_style)
+        } else if name.eq_ignore_ascii_case(INTEGER_DATETIMES.name) {
+            Ok(&self.integer_datetimes)
         } else if name.eq_ignore_ascii_case(APPLICATION_NAME.name) {
             Ok(&self.application_name)
         } else if name.eq_ignore_ascii_case(CLIENT_ENCODING.name) {
@@ -159,6 +200,18 @@ impl SessionVarsInner {
     pub fn set(&mut self, name: &str, val: &str, setter: VarType) -> Result<()> {
         if name.eq_ignore_ascii_case(SERVER_VERSION.name) {
             self.server_version.set_from_str(val, setter)
+        } else if name.eq_ignore_ascii_case(SERVER_VERSION_NUM.name) {
+            self.server_version_num.set_from_str(val, setter)
+        } else if name.eq_ignore_ascii_case(SERVER_ENCODING.name) {
+            self.server_encoding.set_from_str(val, setter)
+        } else if name.eq_ignore_ascii_case(IS_SUPERUSER.name) {
+            self.is_superuser.set_from_str(val, setter)
+        } else if name.eq_ignore_ascii_case(SESSION_AUTHORIZATION.name) {
+            self.session_authorization.set_from_str(val, setter)
+        } else if name.eq_ignore_ascii_case(INTERVAL_STYLE.name) {
+            self.interval_style.set_from_str(val, setter)
+        } else if name.eq_ignore_ascii_case(INTEGER_DATETIMES.name) {
+            self.integer_datetimes.set_from_str(val, setter)
         } else if name.eq_ignore_ascii_case(APPLICATION_NAME.name) {
             self.application_name.set_from_str(val, setter)
         } else if name.eq_ignore_ascii_case(CLIENT_ENCODING.name) {
@@ -216,6 +269,12 @@ impl SessionVarsInner {
     pub(super) fn entries(&self) -> Vec<ConfigEntry> {
         vec![
             self.server_version.config_entry(),
+            self.server_version_num.config_entry(),
+            self.server_encoding.config_entry(),
+            self.is_superuser.config_entry(),
+            self.session_authorization.config_entry(),
+            self.interval_style.config_entry(),
+            self.integer_datetimes.config_entry(),
             self.application_name.config_entry(),
             self.client_encoding.config_entry(),
             self.extra_floating_digits.config_entry(),
@@ -246,6 +305,12 @@ impl Default for SessionVarsInner {
     fn default() -> Self {
         SessionVarsInner {
             server_version: SessionVar::new(&SERVER_VERSION),
+            server_version_num: SessionVar::new(&SERVER_VERSION_NUM),
+            server_encoding: SessionVar::new(&SERVER_ENCODING),
+            is_superuser: SessionVar::new(&IS_SUPERUSER),
+            session_authorization: SessionVar::new(&SESSION_AUTHORIZATION),
+            interval_style: SessionVar::new(&INTERVAL_STYLE),
+            integer_datetimes: SessionVar::new(&INTEGER_DATETIMES),
             application_name: SessionVar::new(&APPLICATION_NAME),
             client_encoding: SessionVar::new(&CLIENT_ENCODING),
             extra_floating_digits: SessionVar::new(&EXTRA_FLOAT_DIGITS),
