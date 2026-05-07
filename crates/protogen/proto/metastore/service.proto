@@ -116,10 +116,17 @@ message AlterTableOperationSetAccessMode {
   catalog.SourceAccessMode access_mode = 1;
 }
 
+// COMMENT ON TABLE <name> IS '<text>' — null/missing comment field clears
+// the existing comment (Postgres semantics for `COMMENT ON … IS NULL`).
+message AlterTableOperationSetComment {
+  optional string comment = 1;
+}
+
 message AlterTableOperation {
   oneof operation {
     AlterTableOperationRename alter_table_operation_rename = 1;
     AlterTableOperationSetAccessMode alter_table_operation_set_access_mode = 2;
+    AlterTableOperationSetComment alter_table_operation_set_comment = 3;
   };
 }
 

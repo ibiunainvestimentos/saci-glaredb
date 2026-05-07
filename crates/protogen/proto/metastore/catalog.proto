@@ -138,7 +138,12 @@ message EntryMeta {
   reserved 8;  // Was `sql_example`.
   reserved 9;  // Was `description`.
 
-  // next: 10
+  // User-provided comment, set by `COMMENT ON {TABLE|...} <name> IS '<text>'`.
+  // Surfaced as `pg_description.description` and as the `comment` column of
+  // `glare_catalog.{tables,views,schemas,databases,functions}`.
+  optional string comment = 10;
+
+  // next: 11
 }
 
 // Defines what kind of access is allowed on the data source.

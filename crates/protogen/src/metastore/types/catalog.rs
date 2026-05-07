@@ -286,6 +286,11 @@ pub struct EntryMeta {
     pub builtin: bool,
     pub external: bool,
     pub is_temp: bool,
+    /// User-supplied comment from `COMMENT ON …`. Surfaces as
+    /// `pg_description.description` and as the `comment` column of the
+    /// matching `glare_catalog` views (tables, views, schemas, databases,
+    /// functions). `None` means "no comment".
+    pub comment: Option<String>,
 }
 
 impl From<EntryMeta> for catalog::EntryMeta {
@@ -299,6 +304,7 @@ impl From<EntryMeta> for catalog::EntryMeta {
             builtin: value.builtin,
             external: value.external,
             is_temp: value.is_temp,
+            comment: value.comment,
         }
     }
 }
@@ -314,6 +320,7 @@ impl TryFrom<catalog::EntryMeta> for EntryMeta {
             builtin: value.builtin,
             external: value.external,
             is_temp: value.is_temp,
+            comment: value.comment,
         })
     }
 }
@@ -459,12 +466,20 @@ pub struct TableEntry {
 }
 
 impl TableEntry {
-    /// Try to get the columns for this table if available.
+    /// Try to get the columns for this table if available. Two sources:
+    ///   1. `TableOptionsV0::Internal.columns` — set for native (delta-backed)
+    ///      GlareDB tables.
+    ///   2. `self.columns` — populated at `CREATE EXTERNAL TABLE` time for
+    ///      every external source where we open a handle and can read the
+    ///      Arrow schema (delta, iceberg, lance, …). This is what makes
+    ///      `pg_catalog.pg_attribute` non-empty for external tables —
+    ///      without it DBeaver shows zero columns when expanding a Delta
+    ///      table in the tree.
     pub fn get_internal_columns(&self) -> Option<Vec<InternalColumnDefinition>> {
-        match self.options {
-            TableOptionsV0::Internal(ref options) => Some(options.columns.clone()),
-            _ => None,
+        if let TableOptionsV0::Internal(ref options) = self.options {
+            return Some(options.columns.clone());
         }
+        self.columns.clone()
     }
 
     pub fn get_columns(&self) -> Option<Vec<FieldRef>> {

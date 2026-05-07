@@ -438,6 +438,9 @@ impl From<CreateExternalDatabase> for service::CreateExternalDatabase {
 pub enum AlterTableOperation {
     RenameTable { new_name: String },
     SetAccessMode { access_mode: SourceAccessMode },
+    /// `COMMENT ON TABLE <name> IS '<text>'` — `None` clears the comment
+    /// (Postgres semantics: `COMMENT ON … IS NULL` removes any prior text).
+    SetComment { comment: Option<String> },
 }
 
 impl TryFrom<service::alter_table_operation::Operation> for AlterTableOperation {
@@ -452,6 +455,9 @@ impl TryFrom<service::alter_table_operation::Operation> for AlterTableOperation 
             ) => Self::SetAccessMode {
                 access_mode: access_mode.try_into()?,
             },
+            service::alter_table_operation::Operation::AlterTableOperationSetComment(
+                service::AlterTableOperationSetComment { comment },
+            ) => Self::SetComment { comment },
         })
     }
 }
@@ -469,6 +475,11 @@ impl From<AlterTableOperation> for service::alter_table_operation::Operation {
                     service::AlterTableOperationSetAccessMode {
                         access_mode: access_mode.into(),
                     },
+                )
+            }
+            AlterTableOperation::SetComment { comment } => {
+                service::alter_table_operation::Operation::AlterTableOperationSetComment(
+                    service::AlterTableOperationSetComment { comment },
                 )
             }
         }

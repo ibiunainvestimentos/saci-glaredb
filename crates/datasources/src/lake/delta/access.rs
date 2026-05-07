@@ -68,3 +68,58 @@ pub async fn load_table_direct(location: &str, opts: StorageOptions) -> Result<D
     // during execution.
     Ok(table)
 }
+
+/// Open a Delta table and return its Arrow schema. Used by the planner at
+/// `CREATE EXTERNAL TABLE` time to populate the catalog so
+/// `pg_catalog.pg_attribute` can enumerate columns of the registered table
+/// — without this, DBeaver / dbt / ibis show zero columns for any
+/// externally-registered Delta table.
+pub async fn load_table_arrow_schema(
+    location: &str,
+    opts: StorageOptions,
+) -> Result<datafusion::arrow::datatypes::Schema> {
+    use datafusion::arrow::datatypes::{DataType as Arrow, Field, TimeUnit};
+    use deltalake::kernel::{DataType as D, PrimitiveType as P};
+
+    let table = load_table_direct(location, opts).await?;
+    let state = table
+        .state
+        .as_ref()
+        .ok_or_else(|| crate::lake::delta::errors::DeltaError::Static(
+            "delta table loaded without a state — schema unavailable",
+        ))?;
+    let delta_schema = state.schema();
+
+    fn to_arrow(t: &D) -> Arrow {
+        match t {
+            D::Primitive(p) => match p {
+                P::String => Arrow::Utf8,
+                P::Long => Arrow::Int64,
+                P::Integer => Arrow::Int32,
+                P::Short => Arrow::Int16,
+                P::Byte => Arrow::Int8,
+                P::Float => Arrow::Float32,
+                P::Double => Arrow::Float64,
+                P::Boolean => Arrow::Boolean,
+                P::Binary => Arrow::Binary,
+                P::Date => Arrow::Date32,
+                P::Timestamp => Arrow::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                P::TimestampNtz => Arrow::Timestamp(TimeUnit::Microsecond, None),
+                P::Decimal(precision, scale) => {
+                    Arrow::Decimal128(*precision, *scale as i8)
+                }
+            },
+            // Nested Arrow types are JSON-serialised on the wire (see
+            // `pgrepr::scalar`); a Utf8 placeholder is sufficient for the
+            // catalog.
+            D::Struct(_) | D::Array(_) | D::Map(_) => Arrow::Utf8,
+        }
+    }
+
+    let fields: Vec<Field> = delta_schema
+        .fields()
+        .iter()
+        .map(|f| Field::new(f.name(), to_arrow(f.data_type()), f.is_nullable()))
+        .collect();
+    Ok(datafusion::arrow::datatypes::Schema::new(fields))
+}

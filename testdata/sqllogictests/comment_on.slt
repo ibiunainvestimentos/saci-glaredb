@@ -1,0 +1,60 @@
+# `COMMENT ON TABLE` round-trip — store and surface via
+# `glare_catalog.tables.comment`, `pg_catalog.pg_description`, and the
+# `obj_description(oid, classname)` shortcut. Column-level comments
+# (`COMMENT ON COLUMN`) are not yet supported (column-level proto field
+# pending) — those should respond with FeatureNotSupported.
+
+statement ok
+set enable_debug_datasources to t;
+
+statement ok
+create schema comment_on_test;
+
+statement ok
+set search_path to comment_on_test;
+
+statement ok
+create external table tab from debug options (table_type = 'never_ending');
+
+# No comment yet.
+query T
+select comment from glare_catalog.tables where table_name='tab' and schema_name='comment_on_test';
+----
+NULL
+
+# Set a comment.
+statement ok
+COMMENT ON TABLE comment_on_test.tab IS 'tab is the demo table';
+
+query T
+select comment from glare_catalog.tables where table_name='tab' and schema_name='comment_on_test';
+----
+tab is the demo table
+
+# pg_description picks it up.
+query T
+select description from pg_catalog.pg_description
+where objoid = (
+    select oid from glare_catalog.tables
+    where table_name='tab' and schema_name='comment_on_test'
+);
+----
+tab is the demo table
+
+# Updating the comment overwrites it.
+statement ok
+COMMENT ON TABLE comment_on_test.tab IS 'updated description';
+
+query T
+select comment from glare_catalog.tables where table_name='tab' and schema_name='comment_on_test';
+----
+updated description
+
+# Column-level comments — not yet supported. Should produce a clean error
+# rather than a silent failure or panic.
+statement error
+COMMENT ON COLUMN comment_on_test.tab.x IS 'demo column';
+
+# Cleanup.
+statement ok
+drop table comment_on_test.tab;

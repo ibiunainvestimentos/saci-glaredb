@@ -530,6 +530,7 @@ mod tests {
                 builtin: false,
                 external: false,
                 is_temp: false,
+                comment: None,
             },
             options: TableOptionsInternal {
                 columns: vec![InternalColumnDefinition {

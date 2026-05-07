@@ -473,6 +473,7 @@ impl TempCatalog {
                     builtin: false,
                     external: false,
                     is_temp: true,
+                    comment: None,
                 },
                 options: TableOptionsInternal {
                     columns: columns.clone(),
@@ -518,6 +519,7 @@ impl TempCatalog {
                     builtin: false,
                     external: false,
                     is_temp: true,
+                    comment: None,
                 },
                 options: TableOptionsInternal {
                     columns: Vec::new(),

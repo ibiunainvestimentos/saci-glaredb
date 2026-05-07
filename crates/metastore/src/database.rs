@@ -710,6 +710,7 @@ impl State {
                         builtin: false,
                         external: true,
                         is_temp: false,
+                        comment: None,
                     },
                     options: create_database.options,
                     tunnel_id,
@@ -740,6 +741,7 @@ impl State {
                         builtin: false,
                         external: false,
                         is_temp: false,
+                        comment: None,
                     },
                     options: create_tunnel.options,
                 };
@@ -775,6 +777,7 @@ impl State {
                         builtin: false,
                         external: false,
                         is_temp: false,
+                        comment: None,
                     },
                     options: create_credentials.options,
                     comment: create_credentials.comment,
@@ -807,6 +810,7 @@ impl State {
                         builtin: false,
                         external: false,
                         is_temp: false,
+                        comment: None,
                     },
                 };
                 self.entries.insert(oid, CatalogEntry::Schema(ent))?;
@@ -830,6 +834,7 @@ impl State {
                         builtin: false,
                         external: false,
                         is_temp: false,
+                        comment: None,
                     },
                     sql: create_view.sql,
                     columns: create_view.columns,
@@ -860,6 +865,7 @@ impl State {
                         builtin: false,
                         external: false,
                         is_temp: false,
+                        comment: None,
                     },
                     options: create_table.options.into(),
                     tunnel_id: None,
@@ -901,6 +907,7 @@ impl State {
                         builtin: false,
                         external: true,
                         is_temp: false,
+                        comment: None,
                     },
                     options: create_ext.options.clone(),
                     tunnel_id,
@@ -974,6 +981,19 @@ impl State {
                             }
                             other => unreachable!("unexpected entry type: {:?}", other),
                         };
+                    }
+                    AlterTableOperation::SetComment { comment } => {
+                        // Tables and views share the `objs.tables` namespace
+                        // in the metastore, so this resolves both. The match
+                        // below reuses the same code path as RENAME.
+                        let oid = objs.tables.get(&alter_table.name).copied().ok_or_else(
+                            || MetastoreError::MissingNamedObject {
+                                schema: alter_table.schema.clone(),
+                                name: alter_table.name.clone(),
+                            },
+                        )?;
+                        let ent = self.entries.get_mut(&oid)?.unwrap();
+                        ent.get_meta_mut().comment = comment;
                     }
                 };
             }
@@ -1065,6 +1085,7 @@ impl State {
                         builtin: false,
                         external: true,
                         is_temp: false,
+                        comment: None,
                     },
                     func_type: f.function_type,
                     signature: Some(f.signature),
@@ -1230,6 +1251,7 @@ impl BuiltinCatalog {
                         builtin: true,
                         external: false,
                         is_temp: false,
+                        comment: None,
                     },
                     options: DatabaseOptions::Internal(DatabaseOptionsInternal {}),
                     tunnel_id: None,
@@ -1252,6 +1274,7 @@ impl BuiltinCatalog {
                         builtin: true,
                         external: false,
                         is_temp: false,
+                        comment: None,
                     },
                 }),
             )?;
@@ -1272,6 +1295,7 @@ impl BuiltinCatalog {
                         builtin: true,
                         external: false,
                         is_temp: false,
+                        comment: None,
                     },
                     options: TableOptionsInternal {
                         columns: table.columns.clone(),
@@ -1307,6 +1331,7 @@ impl BuiltinCatalog {
                         builtin: true,
                         external: false,
                         is_temp: false,
+                        comment: None,
                     },
                     sql: view.sql.to_string(),
                     columns: Vec::new(),
@@ -1407,6 +1432,7 @@ impl BuiltinCatalog {
                     builtin: true,
                     external: false,
                     is_temp: false,
+                    comment: None,
                 };
 
                 ents.push(FunctionEntry {

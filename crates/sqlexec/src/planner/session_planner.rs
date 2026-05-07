@@ -1019,7 +1019,7 @@ impl<'a> SessionPlanner<'a> {
             })?;
         }
 
-        let schema = stmt
+        let user_supplied_schema = stmt
             .columns
             .map(|columns| {
                 let fields = columns
@@ -1055,6 +1055,17 @@ impl<'a> SessionPlanner<'a> {
             .get_tbl_opts_from_v0(datasource.as_str(), m, creds_options, tunnel_options)
             .await?;
 
+        // If the user didn't provide an explicit `(col type, …)` list, try
+        // to infer the schema from the underlying source. Today only Delta
+        // is wired — extending Iceberg / Lance is a follow-up. Storing the
+        // inferred schema makes `pg_attribute` populated for the table,
+        // which is what lets DBeaver / dbt / ibis enumerate columns when
+        // expanding a Delta table in the catalog tree.
+        let schema = match user_supplied_schema {
+            Some(s) => Some(s),
+            None => infer_external_table_schema(&external_table_options).await?,
+        };
+
         let table_name = object_name_to_table_ref(stmt.name)?;
 
         let plan = CreateExternalTable {
@@ -1069,6 +1080,48 @@ impl<'a> SessionPlanner<'a> {
         Ok(plan.into_logical_plan())
     }
 
+}
+
+/// Open the underlying source long enough to read its Arrow schema. Used when
+/// the user does not pass an explicit column list to `CREATE EXTERNAL TABLE`
+/// — without this, `glare_catalog.columns` and therefore
+/// `pg_catalog.pg_attribute` are empty for external tables, which breaks
+/// DBeaver / dbt / ibis catalog navigation.
+///
+/// Returns `None` for sources we don't know how to introspect at registration
+/// time (mysql, postgres, mongo, etc — those go through their own per-table
+/// `try_from`). Any error during schema fetch is propagated as a
+/// `PlanError::String` so misconfigured tables fail at create time, not at
+/// first query.
+async fn infer_external_table_schema(
+    options: &TableOptionsV0,
+) -> Result<Option<Schema>> {
+    use datasources::lake::delta::access::load_table_arrow_schema;
+
+    match options {
+        TableOptionsV0::Delta(delta) => {
+            let arrow = load_table_arrow_schema(&delta.location, delta.storage_options.clone())
+                .await
+                .map_err(|e| {
+                    PlanError::String(format!(
+                        "failed to read schema from delta table {}: {}",
+                        delta.location, e
+                    ))
+                })?;
+            Ok(Some(arrow))
+        }
+        // Other external sources (Iceberg, Lance, postgres, mysql,
+        // snowflake, mongo, bigquery, csv/parquet/json on object store,
+        // etc) don't yet eagerly cache their schema in
+        // `glare_catalog.columns`. Each source has its own metadata
+        // accessor — adding them is mechanical and can ship in a
+        // follow-up. Delta unblocks the highest-volume DBeaver / dbt
+        // workflow today.
+        _ => Ok(None),
+    }
+}
+
+impl<'a> SessionPlanner<'a> {
     fn plan_create_tunnel(&self, mut stmt: CreateTunnelStmt) -> Result<LogicalPlan> {
         let m = &mut stmt.options;
 
@@ -1749,6 +1802,45 @@ impl<'a> SessionPlanner<'a> {
                 .into_logical_plan())
             }
 
+            // `COMMENT ON TABLE <name> IS '<text>'` /
+            // `COMMENT ON COLUMN <table>.<col> IS '<text>'` — sqlparser-rs
+            // 0.43 only models these two `CommentObject` variants. SCHEMA /
+            // DATABASE / VIEW / FUNCTION variants don't parse and surface as
+            // a generic `UnsupportedSQLStatement` further upstream; that's
+            // an acceptable v1 limitation.
+            //
+            // Empty comment (`IS NULL` or omitted) clears any prior text,
+            // matching upstream Postgres semantics.
+            ast::Statement::Comment {
+                object_type,
+                object_name,
+                comment,
+                ..
+            } => {
+                use parser::sqlparser::ast::CommentObject;
+                match object_type {
+                    CommentObject::Table => {
+                        validate_object_name(&object_name)?;
+                        let table_ref = object_name_to_table_ref(object_name)?;
+                        let resolved = self.ctx.resolve_table_ref(table_ref)?;
+                        Ok(AlterTable {
+                            schema: resolved.schema.into_owned(),
+                            name: resolved.name.into_owned(),
+                            operation: AlterTableOperation::SetComment { comment },
+                        }
+                        .into_logical_plan())
+                    }
+                    CommentObject::Column => {
+                        // Column-level comments require a column-level
+                        // proto field; not yet supported. Returning a
+                        // FeatureNotSupported error gives DBeaver a clean
+                        // 0A000 SQLSTATE rather than an XX000.
+                        Err(PlanError::UnsupportedFeature(
+                            "COMMENT ON COLUMN (column-level comments not yet stored)",
+                        ))
+                    }
+                }
+            }
             stmt => Err(PlanError::UnsupportedSQLStatement(stmt.to_string())),
         }
     }

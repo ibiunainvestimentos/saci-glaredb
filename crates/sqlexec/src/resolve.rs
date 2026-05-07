@@ -183,6 +183,7 @@ mod tests {
                     builtin: false,
                     external: false,
                     is_temp: false,
+                    comment: None,
                 },
             }),
             CatalogEntry::Schema(SchemaEntry {
@@ -194,6 +195,7 @@ mod tests {
                     builtin: false,
                     external: false,
                     is_temp: false,
+                    comment: None,
                 },
             }),
             // Tables
@@ -206,6 +208,7 @@ mod tests {
                     builtin: false,
                     external: false,
                     is_temp: false,
+                    comment: None,
                 },
                 options: TableOptionsV0::new_internal(Vec::new()),
                 tunnel_id: None,
@@ -222,6 +225,7 @@ mod tests {
                     builtin: false,
                     external: false,
                     is_temp: false,
+                    comment: None,
                 },
                 options: TableOptionsV0::new_internal(Vec::new()),
                 tunnel_id: None,

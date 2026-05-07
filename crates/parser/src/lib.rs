@@ -557,6 +557,14 @@ impl<'a> GlareDbParser<'a> {
                     self.parser.next_token();
                     self.parse_copy()
                 }
+                // `COMMENT ON {TABLE|COLUMN} <name> IS '<text>'` — sqlparser
+                // hides this behind the Postgres dialect's `parse_statement`
+                // override; with `GenericDialect` upstream returns "Expected
+                // an SQL statement, found: COMMENT". Parse it ourselves.
+                Keyword::COMMENT => {
+                    self.parser.next_token();
+                    Ok(StatementWithExtensions::Statement(self.parse_comment()?))
+                }
                 _ => Ok(StatementWithExtensions::Statement(
                     self.parser.parse_statement()?,
                 )),
@@ -565,6 +573,39 @@ impl<'a> GlareDbParser<'a> {
                 self.parser.parse_statement()?,
             )),
         }
+    }
+
+    /// Parse a `COMMENT ON {TABLE|COLUMN} <name> IS '<text>'` statement.
+    /// Mirrors the Postgres-dialect implementation in upstream sqlparser-rs.
+    fn parse_comment(&mut self) -> Result<ast::Statement, ParserError> {
+        use sqlparser::ast::CommentObject;
+
+        let if_exists = self
+            .parser
+            .parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+        self.parser.expect_keyword(Keyword::ON)?;
+        let token = self.parser.next_token();
+        let (object_type, object_name) = match token.token {
+            Token::Word(w) if w.keyword == Keyword::COLUMN => {
+                (CommentObject::Column, self.parser.parse_object_name(false)?)
+            }
+            Token::Word(w) if w.keyword == Keyword::TABLE => {
+                (CommentObject::Table, self.parser.parse_object_name(false)?)
+            }
+            _ => return self.parser.expected("comment object_type", token),
+        };
+        self.parser.expect_keyword(Keyword::IS)?;
+        let comment = if self.parser.parse_keyword(Keyword::NULL) {
+            None
+        } else {
+            Some(self.parser.parse_literal_string()?)
+        };
+        Ok(ast::Statement::Comment {
+            object_type,
+            object_name,
+            comment,
+            if_exists,
+        })
     }
 
     /// Parse a SQL CREATE statement
