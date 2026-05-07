@@ -637,24 +637,27 @@ impl Session {
 
                 let stream = ExecutionResult::from_stream(stream).await;
 
-                // If we're attached to a remote node, and the result indicates
-                // the operation was a DDL operation, then fetch the newer
-                // catalog from the remote node.
-                if let Some(mut client) = self.ctx.exec_client() {
-                    // Note that 'is error' check tries to cover the case where
-                    // the local client tries to query a table that's been
-                    // changed by a second client (e.g. rename). This check aims
-                    // to make sure we get the latest catalog so that the user
-                    // isn't stuck (the user tries to query using the name table
-                    // name, but the catalog is out of date and doesn't know
-                    // about it).
-                    //
-                    // This check is overly broad in that we'll try to get the
-                    // catalog on every error. We can look into adding more
-                    // detail on the grpc response stream from the remote node
-                    // to provide a better hint of what we should be doing on
-                    // error.
-                    if stream.is_ddl() || stream.is_error() {
+                // After a DDL or error, refresh the session's view of the
+                // catalog so the same session sees its own writes. Two
+                // paths depending on whether we're attached to a remote
+                // exec node:
+                //
+                // - Remote: fetch_catalog + swap_state (round-trips to
+                //   the exec node and replaces the local snapshot).
+                // - Local (pgsrv → asyncpg / psql / DBeaver): pull the
+                //   latest committed state from the metastore worker via
+                //   `maybe_refresh_state`. Without this branch, local
+                //   DDL writes (e.g. `COMMENT ON TABLE` followed by
+                //   re-reading `pg_description` in the same session)
+                //   return the pre-mutation value because the
+                //   `SessionCatalog` snapshot was loaded once on session
+                //   start and never refreshed.
+                //
+                // The `is error` check covers the case where a second
+                // client mutates a table this session has cached — keep
+                // it so the user isn't stuck on a stale-catalog error.
+                if stream.is_ddl() || stream.is_error() {
+                    if let Some(mut client) = self.ctx.exec_client() {
                         // TODO: Instead of swapping here, I'd like to if we
                         // could go towards collecting a "diff" of a session
                         // (including new catalog states, variable changes, etc)
@@ -665,6 +668,8 @@ impl Session {
                         self.ctx
                             .get_session_catalog_mut()
                             .swap_state(Arc::new(state));
+                    } else {
+                        self.ctx.maybe_refresh_state().await?;
                     }
                 }
 

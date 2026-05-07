@@ -31,3 +31,26 @@ statement ok
 
 statement ok
 DiScArD aLl;
+
+# asyncpg's `Connection.reset()` sends a multi-statement combined string
+# at every pool release. is_postgres_noop must split on `;` and accept
+# any combination of single no-op statements + the literal advisory-
+# unlock + CLOSE ALL pieces.
+statement ok
+SELECT pg_advisory_unlock_all();
+CLOSE ALL;
+UNLISTEN *;
+RESET ALL;
+
+# A proper subset of the same multi-statement form.
+statement ok
+UNLISTEN *;
+RESET ALL;
+
+statement ok
+DISCARD PLANS;
+DISCARD SEQUENCES;
+
+# CLOSE ALL standalone (cursor housekeeping).
+statement ok
+CLOSE ALL;

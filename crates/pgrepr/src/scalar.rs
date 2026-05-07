@@ -155,6 +155,18 @@ impl Scalar {
             DfScalar::Int16(Some(v)) => Self::Int2(v),
             DfScalar::Int32(Some(v)) => Self::Int4(v),
             DfScalar::Int64(Some(v)) => Self::Int8(v),
+            // Unsigned integer arms — required because pg_catalog views
+            // expose `oid` columns as Arrow UInt32 (see builtins.rs
+            // GLARE_*.oid columns + pg_class.oid view body) and
+            // `arrow_to_pg_type_info` announces them as PG INT4. Without
+            // explicit arms here, UInt* values fell through to
+            // `Scalar::Other` and the BinaryWriter default `write_any`
+            // silently emitted ASCII digits instead of 4 BE bytes →
+            // asyncpg `BufferError: unexpected trailing N bytes`.
+            DfScalar::UInt8(Some(v)) => Self::Int2(v as i16),
+            DfScalar::UInt16(Some(v)) => Self::Int2(v as i16),
+            DfScalar::UInt32(Some(v)) => Self::Int4(v as i32),
+            DfScalar::UInt64(Some(v)) => Self::Int8(v as i64),
             DfScalar::Float32(Some(v)) => Self::Float4(v),
             DfScalar::Float64(Some(v)) => Self::Float8(v),
             DfScalar::Utf8(Some(v)) => Self::Text(v),
@@ -783,6 +795,70 @@ mod tests {
         match scalar {
             Scalar::Text(s) => assert_eq!(s, r#"{"type":"Put","strike":50.0}"#),
             other => panic!("expected Scalar::Text, got {other:?}"),
+        }
+    }
+
+    // ---- UInt arms: pg_catalog `oid` columns are UInt32; binary clients
+    //      (asyncpg, JDBC) need 4 BE bytes, not ASCII digits. Without
+    //      these arms, UInt32 fell through to Scalar::Other and the
+    //      BinaryWriter default emitted the wrong wire bytes. ----
+
+    #[test]
+    fn from_datafusion_uint32_routes_to_int4() {
+        let scalar = Scalar::from_datafusion(DfScalar::UInt32(Some(16401)), &PgType::OID);
+        match scalar {
+            Scalar::Int4(v) => assert_eq!(v, 16401_i32),
+            other => panic!("expected Scalar::Int4, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_datafusion_uint64_routes_to_int8() {
+        let scalar =
+            Scalar::from_datafusion(DfScalar::UInt64(Some(1_000_000_000_000)), &PgType::INT8);
+        match scalar {
+            Scalar::Int8(v) => assert_eq!(v, 1_000_000_000_000_i64),
+            other => panic!("expected Scalar::Int8, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_datafusion_uint16_routes_to_int2() {
+        let scalar = Scalar::from_datafusion(DfScalar::UInt16(Some(42_000)), &PgType::INT2);
+        match scalar {
+            Scalar::Int2(v) => assert_eq!(v, 42_000_u16 as i16),
+            other => panic!("expected Scalar::Int2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_datafusion_uint8_routes_to_int2() {
+        let scalar = Scalar::from_datafusion(DfScalar::UInt8(Some(200)), &PgType::INT2);
+        match scalar {
+            Scalar::Int2(v) => assert_eq!(v, 200_i16),
+            other => panic!("expected Scalar::Int2, got {other:?}"),
+        }
+    }
+
+    /// Regression test for the `BufferError: unexpected trailing N bytes`
+    /// asyncpg failure on `oid` columns: a UInt32 value going through
+    /// the BinaryWriter should produce 4 BE bytes, not ASCII digits.
+    #[test]
+    fn uint32_oid_binary_encoding_is_4_be_bytes() {
+        use bytes::BytesMut;
+
+        use crate::scalar::Scalar;
+        use crate::writer::{BinaryWriter, Writer};
+
+        let mut buf = BytesMut::new();
+        let scalar = Scalar::from_datafusion(DfScalar::UInt32(Some(16401)), &PgType::OID);
+        match scalar {
+            Scalar::Int4(v) => {
+                BinaryWriter::write_int4(&mut buf, v).unwrap();
+                assert_eq!(buf.as_ref(), 16401_i32.to_be_bytes().as_ref());
+                assert_eq!(buf.len(), 4);
+            }
+            other => panic!("expected Scalar::Int4 for UInt32, got {other:?}"),
         }
     }
 }

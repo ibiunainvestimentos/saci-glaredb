@@ -454,6 +454,16 @@ struct ClientSession<C, S> {
     ///   InBlock --error--> Failed
     ///   Failed  --ROLLBACK or COMMIT--> Idle
     tx_status: TransactionStatus,
+    /// Statement names that the `parse_sql` preprocessor identified as
+    /// connection-housekeeping no-ops (`RESET ALL`, `UNLISTEN *`, etc.).
+    /// Maps statement name → CommandComplete tag to emit at Execute time
+    /// (e.g. "RESET", "DISCARD ALL"). Populated at Parse, consumed at
+    /// Execute, evicted at Close.
+    noop_tags: HashMap<String, &'static str>,
+    /// Portal name → CommandComplete tag, for the extended-query path.
+    /// Populated at Bind time when the bound statement is a no-op,
+    /// consumed at Execute, evicted at Close.
+    portal_noop_tags: HashMap<String, &'static str>,
 }
 
 /// This helper macro is used so we can call some `get_*` methods on the
@@ -483,6 +493,8 @@ where
             session,
             conn,
             tx_status: TransactionStatus::Idle,
+            noop_tags: HashMap::new(),
+            portal_noop_tags: HashMap::new(),
         }
     }
 
@@ -590,12 +602,24 @@ where
         let session = &mut self.session;
         let conn = &mut self.conn;
 
-        let stmts = match parse_sql(session.get_session_vars(), &sql) {
-            Ok(stmts) => stmts,
+        let parsed = match parse_sql(session.get_session_vars(), &sql) {
+            Ok(p) => p,
             Err(e) => {
                 self.send_error(e).await?;
                 return self.ready_for_query().await;
             }
+        };
+
+        // Connection-housekeeping no-ops short-circuit here: emit one
+        // CommandComplete with the canonical PG tag so asyncpg's
+        // `Connection.reset()` decoder succeeds. EmptyQueryResponse is
+        // NOT a valid substitute (asyncpg's tag.decode() fails on None).
+        let stmts = match parsed {
+            ParsedSql::Noop(tag) => {
+                Self::command_complete(conn, tag).await?;
+                return self.ready_for_query().await;
+            }
+            ParsedSql::Stmts(stmts) => stmts,
         };
 
         // Determines if we send back an empty query response.
@@ -692,9 +716,28 @@ where
     async fn parse(&mut self, name: String, sql: String, param_types: Vec<i32>) -> Result<()> {
         // TODO: Ensure in transaction.
         let vars = self.session.get_session_vars();
-        let mut stmts = match parse_sql(vars, &sql) {
-            Ok(stmts) => stmts,
+        let parsed = match parse_sql(vars, &sql) {
+            Ok(p) => p,
             Err(e) => return self.send_error(e).await,
+        };
+
+        // Connection-housekeeping no-ops in the extended-query flow:
+        // record the tag against the statement name, prepare an empty
+        // statement (so Bind / Describe / Close all work), and send
+        // ParseComplete. The Execute path emits the recorded tag.
+        let mut stmts = match parsed {
+            ParsedSql::Noop(tag) => {
+                self.noop_tags.insert(name.clone(), tag);
+                return match self
+                    .session
+                    .prepare_statement(name, None, param_types)
+                    .await
+                {
+                    Ok(_) => self.conn.send(BackendMessage::ParseComplete).await,
+                    Err(e) => self.send_error(e.into()).await,
+                };
+            }
+            ParsedSql::Stmts(stmts) => stmts,
         };
 
         // Can only have one statement per parse.
@@ -754,6 +797,12 @@ where
             Err(e) => return self.send_error(e).await,
         };
 
+        // Propagate no-op tag from statement → portal so the Execute
+        // path can emit the right CommandComplete tag.
+        if let Some(tag) = self.noop_tags.get(&statement).copied() {
+            self.portal_noop_tags.insert(portal.clone(), tag);
+        }
+
         match self
             .session
             .bind_statement(portal, &statement, scalars, result_formats)
@@ -812,6 +861,13 @@ where
     }
 
     async fn execute(&mut self, portal: String, max_rows: i32) -> Result<()> {
+        // Connection-housekeeping no-op: short-circuit with the recorded
+        // CommandComplete tag instead of running through execute_portal
+        // (which would emit EmptyQueryResponse — wrong for asyncpg).
+        if let Some(tag) = self.portal_noop_tags.get(&portal).copied() {
+            return Self::command_complete(&mut self.conn, tag).await;
+        }
+
         let conn = &mut self.conn;
         let session = &mut self.session;
         let stream = match session.execute_portal(&portal, max_rows).await {
@@ -847,8 +903,14 @@ where
 
     async fn close_object(&mut self, object_type: DescribeObjectType, name: String) -> Result<()> {
         match object_type {
-            DescribeObjectType::Statement => self.session.remove_prepared_statement(&name),
-            DescribeObjectType::Portal => self.session.remove_portal(&name),
+            DescribeObjectType::Statement => {
+                self.session.remove_prepared_statement(&name);
+                self.noop_tags.remove(&name);
+            }
+            DescribeObjectType::Portal => {
+                self.session.remove_portal(&name);
+                self.portal_noop_tags.remove(&name);
+            }
         }
         self.conn.send(BackendMessage::CloseComplete).await
     }
@@ -982,49 +1044,91 @@ where
     }
 }
 
+/// Outcome of `parse_sql`: either a statement list to plan + execute, or
+/// a no-op tag to emit directly as `CommandComplete` without going
+/// through the planner.
+enum ParsedSql {
+    Stmts(VecDeque<StatementWithExtensions>),
+    /// One of the connection-housekeeping commands listed in
+    /// `is_postgres_noop`. The carried tag is the wire-protocol
+    /// `CommandComplete` tag (e.g. `"RESET"`, `"DISCARD ALL"`,
+    /// `"UNLISTEN"`).
+    Noop(&'static str),
+}
+
 /// Parse a sql string, returning an error response if failed to parse.
 ///
 /// Before handing the string to the underlying parser we shortcut a small
 /// set of Postgres housekeeping statements that GlareDB does not need to
 /// model — `RESET ALL`, `DISCARD ALL` / `DISCARD TEMP` / `DISCARD PLANS` /
-/// `DISCARD SEQUENCES`, `DEALLOCATE ALL`, and `UNLISTEN *`. These are
-/// emitted by JDBC / asyncpg / DBeaver on every connection-pool release;
-/// rejecting them forces clients into bespoke connection-class shims (see
-/// sacibackend `_GlareDBConnection.reset()` for the prior workaround).
-/// Returning an empty statement list makes the caller emit an
-/// `EmptyQueryResponse` — a valid wire-protocol reply that every Postgres
-/// driver tolerates.
-fn parse_sql(
-    session_vars: SessionVars,
-    sql: &str,
-) -> Result<VecDeque<StatementWithExtensions>, ErrorResponse> {
-    if is_postgres_noop(sql) {
-        return Ok(VecDeque::new());
+/// `DISCARD SEQUENCES`, `DEALLOCATE ALL`, `UNLISTEN *`, and the
+/// multi-statement combined string asyncpg's `Connection.reset()` sends
+/// (`SELECT pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *; RESET ALL;`).
+///
+/// These are emitted by JDBC / asyncpg / DBeaver on every
+/// connection-pool release. Rejecting them forces clients into bespoke
+/// connection-class shims (see sacibackend `_GlareDBConnection.reset()`
+/// for the prior workaround). Each driver expects a `CommandComplete`
+/// with a matching tag (e.g. `RESET`) — `EmptyQueryResponse` is NOT a
+/// valid substitute (asyncpg's tag decoder fails on None).
+fn parse_sql(session_vars: SessionVars, sql: &str) -> Result<ParsedSql, ErrorResponse> {
+    if let Some(tag) = is_postgres_noop(sql) {
+        return Ok(ParsedSql::Noop(tag));
     }
     match session_vars.dialect() {
         Dialect::Prql => parser::parse_prql(sql),
         Dialect::Sql => parser::parse_sql(sql),
     }
+    .map(ParsedSql::Stmts)
     .map_err(|e| ErrorResponse::error(pgrepr::notice::SqlState::SyntaxError, e.to_string()))
 }
 
-/// True for Postgres housekeeping commands that GlareDB silently accepts.
-/// Match is case-insensitive, ignores leading/trailing whitespace and an
-/// optional trailing semicolon.
-fn is_postgres_noop(sql: &str) -> bool {
-    let trimmed = sql.trim().trim_end_matches(';').trim();
-    let lower = trimmed.to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "reset all"
-            | "discard all"
-            | "discard temp"
-            | "discard temporary"
-            | "discard plans"
-            | "discard sequences"
-            | "deallocate all"
-            | "unlisten *"
-    )
+/// Map a connection-housekeeping SQL string to the wire-protocol
+/// `CommandComplete` tag GlareDB should emit. Returns `None` if the
+/// statement isn't recognized as a no-op (caller should hand it to the
+/// real parser).
+///
+/// Accepts both single statements and the multi-statement combined
+/// string asyncpg sends in `Connection.reset()`. Bails on quoted strings
+/// because splitting on `;` across a string literal would partition the
+/// literal incorrectly — caller falls back to the parser, which still
+/// fails today, but we've never seen a real driver quote-wrap a reset
+/// command.
+fn is_postgres_noop(sql: &str) -> Option<&'static str> {
+    if sql.contains('\'') || sql.contains('"') {
+        return None;
+    }
+    fn match_one(piece: &str) -> Option<&'static str> {
+        match piece.trim().to_ascii_lowercase().as_str() {
+            "reset all" => Some("RESET"),
+            "discard all" => Some("DISCARD ALL"),
+            "discard temp" | "discard temporary" => Some("DISCARD TEMP"),
+            "discard plans" => Some("DISCARD PLANS"),
+            "discard sequences" => Some("DISCARD SEQUENCES"),
+            "deallocate all" => Some("DEALLOCATE ALL"),
+            "unlisten *" => Some("UNLISTEN"),
+            // Members of asyncpg's combined `Connection.reset()` query —
+            // GlareDB doesn't track listen channels, advisory locks, or
+            // open cursors by session, so each is a free no-op.
+            "close all" => Some("CLOSE CURSOR ALL"),
+            "select pg_advisory_unlock_all()" => Some("SELECT"),
+            _ => None,
+        }
+    }
+
+    let pieces: Vec<&str> = sql
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if pieces.is_empty() {
+        return None;
+    }
+    let mut last_tag = None;
+    for piece in pieces {
+        last_tag = Some(match_one(piece)?);
+    }
+    last_tag
 }
 
 /// Decodes inputs for a prepared query into the appropriate scalar values.

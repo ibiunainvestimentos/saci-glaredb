@@ -190,6 +190,23 @@ impl Writer for BinaryWriter {
             "cannot encode decimal (numeric) value into PG binary".to_string(),
         ))
     }
+
+    /// Override the trait default for binary format only. The default
+    /// implementation calls `encode_string`, which silently emits ASCII
+    /// digits — wrong for binary clients (e.g. asyncpg announcing INT4
+    /// for an `oid` column receives `b"16401"` instead of 4 BE bytes
+    /// and fails with "unexpected trailing N bytes").
+    ///
+    /// Fail closed: if a `Scalar` variant reaches this path under the
+    /// binary writer, the missing match arm in `Scalar::from_datafusion`
+    /// is the bug. Caller will surface the error and the encoder gap
+    /// can be fixed deterministically.
+    fn write_any<T: Display>(_buf: &mut BytesMut, v: &T) -> Result<()> {
+        Err(PgReprError::InternalError(format!(
+            "binary writer: no encoder for value `{v}` — \
+             add an explicit arm in `Scalar::from_datafusion`"
+        )))
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,46 @@
+# Wire-format coverage for `oid` columns over the binary path.
+#
+# pg_catalog views expose `oid` columns sourced from Arrow `UInt32`.
+# Without explicit UInt arms in `Scalar::from_datafusion`, UInt32 values
+# fell through to `Scalar::Other` and the BinaryWriter default emitted
+# ASCII digits (text format) instead of 4 BE bytes — asyncpg's prepared-
+# statement decoder failed with `BufferError: unexpected trailing N
+# bytes`. Casting to BIGINT was the workaround.
+#
+# slt can't directly verify binary-format encoding (it only round-trips
+# text), but a SELECT that includes `oid` in a multi-column projection
+# is a useful regression smoke test — it catches plan-time / type-
+# coercion regressions even when the wire-format issue can only be
+# verified end-to-end via the asyncpg bench harness.
+
+# Single-column oid select.
+query I
+select oid from pg_catalog.pg_namespace where nspname = 'pg_catalog';
+----
+12
+
+# Multi-column row with oid + text + text (the shape that triggered
+# the BufferError in the bench).
+query ITT
+select c.oid, c.relname, n.nspname
+from pg_catalog.pg_class c
+join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+where n.nspname = 'pg_catalog' and c.relname = 'pg_class'
+limit 1;
+----
+479 pg_class pg_catalog
+
+# pg_attribute.atttypid is also UInt32 and routes through the same arm.
+# Resolve a real PG OID via the join and confirm it round-trips.
+query IT
+select a.atttypid, t.typname
+from pg_catalog.pg_attribute a
+join pg_catalog.pg_class c on c.oid = a.attrelid
+join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+join pg_catalog.pg_type t on t.oid = a.atttypid
+where n.nspname = 'pg_catalog'
+  and c.relname = 'pg_namespace'
+  and a.attname = 'nspname'
+limit 1;
+----
+25 text

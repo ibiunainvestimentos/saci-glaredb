@@ -50,6 +50,43 @@ select comment from glare_catalog.tables where table_name='tab' and schema_name=
 ----
 updated description
 
+# Multi-write same-session round-trips — every write must be visible to
+# the next read. Without the local-session DDL refresh in
+# `sqlexec/src/session.rs` (the post-DDL `maybe_refresh_state` branch),
+# the session catalog snapshot stays at the FIRST written value and
+# every subsequent read returns the stale one. Exercises the asyncpg
+# write-then-read-then-overwrite-then-read pattern that surfaced the
+# stale-cache bug in the bench D end-to-end test.
+statement ok
+COMMENT ON TABLE comment_on_test.tab IS 'rev-1';
+
+query T
+select description from pg_catalog.pg_description
+where objoid = (select oid from glare_catalog.tables
+                where table_name='tab' and schema_name='comment_on_test');
+----
+rev-1
+
+statement ok
+COMMENT ON TABLE comment_on_test.tab IS 'rev-2';
+
+query T
+select description from pg_catalog.pg_description
+where objoid = (select oid from glare_catalog.tables
+                where table_name='tab' and schema_name='comment_on_test');
+----
+rev-2
+
+statement ok
+COMMENT ON TABLE comment_on_test.tab IS 'rev-3';
+
+query T
+select description from pg_catalog.pg_description
+where objoid = (select oid from glare_catalog.tables
+                where table_name='tab' and schema_name='comment_on_test');
+----
+rev-3
+
 # Column-level comments — not yet supported. Should produce a clean error
 # rather than a silent failure or panic.
 statement error
