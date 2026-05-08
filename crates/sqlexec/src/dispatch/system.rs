@@ -610,6 +610,7 @@ impl<'a> SystemTableDispatcher<'a> {
         let mut sql_examples = StringBuilder::new();
         let mut descriptions = StringBuilder::new();
         let mut argument_types = ListBuilder::new(StringBuilder::new());
+        let mut argument_oids_text = StringBuilder::new();
         let mut return_type = StringBuilder::new();
         let mut is_set_returning = BooleanBuilder::new();
 
@@ -650,10 +651,32 @@ impl<'a> SystemTableDispatcher<'a> {
                 let arg_names = first_exact_arg_types(&sig.type_signature)
                     .map(|v| v.into_iter().map(Some).collect::<Vec<_>>())
                     .unwrap_or_default();
+
+                // Format the arg list as a Postgres `oidvector` wire
+                // string (`"23 25 1043"`) before consuming `arg_names`
+                // into `argument_types`. `pg_proc.proargtypes` requires
+                // a token per positional slot, so map `None` → "0"
+                // (InvalidOid) rather than dropping the slot — PgJDBC's
+                // tokenizer counts positions. `arrow_name_to_pg_oid`
+                // resolves unknown Arrow names to OID 25 (text); we
+                // accept that inherited fallback here since
+                // `first_exact_arg_types` already filtered to types
+                // that the arrow→pg map should know.
+                let oids_text = arg_names
+                    .iter()
+                    .map(|opt| match opt.as_deref() {
+                        Some(n) => pgrepr::pg_type_oid::arrow_name_to_pg_oid(n).to_string(),
+                        None => "0".to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                argument_oids_text.append_value(&oids_text);
+
                 argument_types.append_value(arg_names);
             } else {
                 parameters.append_value(EMPTY);
                 argument_types.append_value(EMPTY);
+                argument_oids_text.append_null();
             }
 
             builtin.append_value(func.builtin);
@@ -683,6 +706,7 @@ impl<'a> SystemTableDispatcher<'a> {
                 Arc::new(sql_examples.finish()),
                 Arc::new(descriptions.finish()),
                 Arc::new(argument_types.finish()),
+                Arc::new(argument_oids_text.finish()),
                 Arc::new(return_type.finish()),
                 Arc::new(is_set_returning.finish()),
             ],

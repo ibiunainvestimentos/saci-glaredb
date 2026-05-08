@@ -1,0 +1,82 @@
+# `pg_catalog.pg_proc` — function metadata.
+#
+# Sourced from `glare_catalog.functions`. Critical column for PgJDBC:
+# `proargtypes` (oidvector wire form, `"23 25 1043"`) — the driver's
+# `getFunctionColumns` runs `StringTokenizer` over this and yields one
+# param row per token. NULL → zero tokens → every function shows
+# zero parameters; the fix is to emit a parseable oidvector string.
+
+# Smoke: pg_proc is queryable and has rows for every builtin.
+query B
+SELECT COUNT(*) > 0 FROM pg_catalog.pg_proc;
+----
+true
+
+# `proname` and `pronamespace` are populated for every function.
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_proc
+WHERE proname IS NULL OR pronamespace IS NULL;
+----
+0
+
+# `prokind` is `'f'` for normal functions, `'a'` for aggregates — never
+# NULL. PgJDBC PG 11+ branches on this in `getFunctions`.
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_proc
+WHERE prokind NOT IN ('f', 'a');
+----
+0
+
+# `prorettype` resolves via `pg_type_oid_by_name` for functions with a
+# recorded return type, else 0 (InvalidOid). Either way, never NULL.
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_proc WHERE prorettype IS NULL;
+----
+0
+
+# `proargtypes` carries the oidvector wire string — never NULL after
+# this commit. Empty string is fine for nullary functions.
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_proc WHERE proargtypes IS NULL;
+----
+0
+
+# `proallargtypes` mirrors `proargtypes` (we don't carry OUT/INOUT
+# distinction). Same null-safe contract.
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_proc WHERE proallargtypes IS NULL;
+----
+0
+
+# Spot-check: `generate_series` has at least one Exact signature with
+# 2-3 args — its `proargtypes` should be a non-empty space-separated
+# decimal sequence.
+query B
+SELECT COUNT(*) > 0
+FROM pg_catalog.pg_proc
+WHERE proname = 'generate_series'
+  AND proargtypes ~ '^[0-9]+( [0-9]+)*$';
+----
+true
+
+# Spot-check: `_pg_expandarray` (added in this work) takes one TEXT
+# arg → OID 25 (text). `proargtypes` should be the literal `'25'`.
+query T
+SELECT proargtypes FROM pg_catalog.pg_proc
+WHERE proname = '_pg_expandarray';
+----
+25
+
+# `proretset` is populated from `is_set_returning` — `_pg_expandarray`
+# is set-returning so this is `true`.
+query B
+SELECT proretset FROM pg_catalog.pg_proc
+WHERE proname = '_pg_expandarray';
+----
+true
+
+# Aggregate spot-check: aggregates have prokind='a'.
+query B
+SELECT COUNT(*) > 0 FROM pg_catalog.pg_proc WHERE prokind = 'a';
+----
+true

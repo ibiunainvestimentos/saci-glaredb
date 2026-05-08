@@ -1,0 +1,46 @@
+# `pg_catalog.pg_constraint` — constraint metadata.
+#
+# `glare_catalog.constraints` is empty today (Delta tables have no
+# PK/FK enforcement), so the column-shape probe is what matters.
+# `conkey` / `confkey` are `int2[]` upstream, formatted as
+# `{1,2,3}` on the wire. We convert from our internal
+# space-separated `column_positions` ('1 2 3') at view time.
+
+# Queryable, zero rows today.
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_constraint;
+----
+0
+
+# Schema sanity — every PG 16 column we project is selectable.
+statement ok
+SELECT oid, conname, connamespace, contype, condeferrable,
+       condeferred, convalidated, conrelid, contypid, conindid,
+       conparentid, confrelid, confupdtype, confdeltype,
+       confmatchtype, conislocal, coninhcount, connoinherit,
+       conkey, confkey, conpfeqop, conppeqop, conffeqop,
+       confdelsetcols, conexclop, conbin
+FROM pg_catalog.pg_constraint;
+
+# Probe the column-shape via WHERE 1<>1 — DBeaver's connect-time form.
+statement ok
+SELECT * FROM pg_catalog.pg_constraint WHERE 1 <> 1;
+
+# Spot-check the int2[] formatter shape independently of constraint
+# rows. `replace(... , ' ', ',')` + brace wrap should produce
+# Postgres array literal form.
+query T
+SELECT '{' || replace('1 2 3', ' ', ',') || '}';
+----
+{1,2,3}
+
+query T
+SELECT '{' || replace('5', ' ', ',') || '}';
+----
+{5}
+
+# Single-key constraint shape.
+query T
+SELECT '{' || replace('1', ' ', ',') || '}';
+----
+{1}

@@ -1,0 +1,87 @@
+# Empty-stub views shipped to satisfy psql `\d+`, pgAdmin Dashboard,
+# and ad-hoc tooling probes. Each is a single `SELECT * WHERE 1<>1`
+# probe — the contract is that the column list resolves; the rows
+# are intentionally absent.
+
+statement ok
+SELECT * FROM pg_catalog.pg_stat_user_tables WHERE 1 <> 1;
+
+statement ok
+SELECT * FROM pg_catalog.pg_stat_user_indexes WHERE 1 <> 1;
+
+statement ok
+SELECT * FROM pg_catalog.pg_statio_user_tables WHERE 1 <> 1;
+
+statement ok
+SELECT * FROM pg_catalog.pg_publication_tables WHERE 1 <> 1;
+
+statement ok
+SELECT * FROM pg_catalog.pg_partitioned_table WHERE 1 <> 1;
+
+statement ok
+SELECT * FROM pg_catalog.pg_policy WHERE 1 <> 1;
+
+statement ok
+SELECT * FROM pg_catalog.pg_policies WHERE 1 <> 1;
+
+statement ok
+SELECT * FROM pg_catalog.pg_seclabel WHERE 1 <> 1;
+
+statement ok
+SELECT * FROM pg_catalog.pg_shseclabel WHERE 1 <> 1;
+
+statement ok
+SELECT * FROM pg_catalog.pg_init_privs WHERE 1 <> 1;
+
+statement ok
+SELECT * FROM pg_catalog.pg_largeobject WHERE 1 <> 1;
+
+statement ok
+SELECT * FROM pg_catalog.pg_largeobject_metadata WHERE 1 <> 1;
+
+statement ok
+SELECT * FROM pg_catalog.pg_timezone_names WHERE 1 <> 1;
+
+statement ok
+SELECT * FROM pg_catalog.pg_timezone_abbrevs WHERE 1 <> 1;
+
+statement ok
+SELECT * FROM pg_catalog.pg_prepared_statements WHERE 1 <> 1;
+
+statement ok
+SELECT * FROM pg_catalog.pg_cursors WHERE 1 <> 1;
+
+statement ok
+SELECT * FROM pg_catalog.pg_user_mappings WHERE 1 <> 1;
+
+statement ok
+SELECT * FROM pg_catalog.pg_rules WHERE 1 <> 1;
+
+statement ok
+SELECT * FROM pg_catalog.pg_sequences WHERE 1 <> 1;
+
+# All medium-priority stubs are zero-row.
+query II
+SELECT
+    (SELECT COUNT(*) FROM pg_catalog.pg_stat_user_tables) +
+    (SELECT COUNT(*) FROM pg_catalog.pg_stat_user_indexes) +
+    (SELECT COUNT(*) FROM pg_catalog.pg_statio_user_tables) +
+    (SELECT COUNT(*) FROM pg_catalog.pg_publication_tables) +
+    (SELECT COUNT(*) FROM pg_catalog.pg_partitioned_table) +
+    (SELECT COUNT(*) FROM pg_catalog.pg_policy) +
+    (SELECT COUNT(*) FROM pg_catalog.pg_policies) +
+    (SELECT COUNT(*) FROM pg_catalog.pg_seclabel) +
+    (SELECT COUNT(*) FROM pg_catalog.pg_shseclabel) +
+    (SELECT COUNT(*) FROM pg_catalog.pg_init_privs) +
+    (SELECT COUNT(*) FROM pg_catalog.pg_largeobject) +
+    (SELECT COUNT(*) FROM pg_catalog.pg_largeobject_metadata) +
+    (SELECT COUNT(*) FROM pg_catalog.pg_timezone_names) +
+    (SELECT COUNT(*) FROM pg_catalog.pg_timezone_abbrevs) +
+    (SELECT COUNT(*) FROM pg_catalog.pg_prepared_statements) +
+    (SELECT COUNT(*) FROM pg_catalog.pg_cursors) +
+    (SELECT COUNT(*) FROM pg_catalog.pg_user_mappings) +
+    (SELECT COUNT(*) FROM pg_catalog.pg_rules) +
+    (SELECT COUNT(*) FROM pg_catalog.pg_sequences) AS total_rows,
+    19 AS expected_view_count;
+----
+0  19

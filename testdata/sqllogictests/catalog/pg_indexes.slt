@@ -1,0 +1,18 @@
+# `pg_catalog.pg_indexes` — joined index metadata. Maps directly
+# to upstream system_views.sql's `pg_indexes` definition over
+# pg_index ↔ pg_class ↔ pg_namespace.
+
+# Queryable.
+statement ok
+SELECT * FROM pg_catalog.pg_indexes;
+
+# Column shape probe — DBeaver Index tab issues this at startup.
+statement ok
+SELECT schemaname, tablename, indexname, tablespace, indexdef
+FROM pg_catalog.pg_indexes WHERE 1 <> 1;
+
+# `glare_catalog.indexes` is empty today, so zero rows.
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_indexes;
+----
+0

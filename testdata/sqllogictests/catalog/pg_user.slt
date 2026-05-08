@@ -1,0 +1,35 @@
+# `pg_catalog.pg_user` / `pg_shadow` / `pg_group` — views over
+# `pg_authid` per upstream system_views.sql. PgJDBC's
+# `DatabaseMetaData.getUserName()` queries pg_user.
+
+# `pg_user` returns the single login role.
+query T
+SELECT usename FROM pg_catalog.pg_user;
+----
+glaredb
+
+query II
+SELECT usesysid, CASE WHEN usesuper THEN 1 ELSE 0 END FROM pg_catalog.pg_user;
+----
+10 1
+
+# Column shape probe.
+statement ok
+SELECT usename, usesysid, usecreatedb, usesuper, userepl,
+       usebypassrls, passwd, valuntil, useconfig
+FROM pg_catalog.pg_user WHERE 1 <> 1;
+
+# `pg_shadow` mirrors `pg_user`.
+query T
+SELECT usename FROM pg_catalog.pg_shadow;
+----
+glaredb
+
+# `pg_group` excludes login roles — empty.
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_group;
+----
+0
+
+statement ok
+SELECT groname, grosysid, grolist FROM pg_catalog.pg_group WHERE 1 <> 1;

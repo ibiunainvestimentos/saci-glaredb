@@ -1,0 +1,33 @@
+# `pg_catalog.pg_stat_activity` — single-row stub for the current
+# session. pgAdmin's Dashboard breaks if this is empty.
+
+# Single row.
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_stat_activity;
+----
+1
+
+# Spot-check key columns.
+query TT
+SELECT datname, state FROM pg_catalog.pg_stat_activity;
+----
+default  active
+
+query T
+SELECT backend_type FROM pg_catalog.pg_stat_activity;
+----
+client backend
+
+query T
+SELECT usename FROM pg_catalog.pg_stat_activity;
+----
+glaredb
+
+# Column-shape probe — full PG 16 22-col shape.
+statement ok
+SELECT datid, datname, pid, leader_pid, usesysid, usename,
+       application_name, client_addr, client_hostname, client_port,
+       backend_start, xact_start, query_start, state_change,
+       wait_event_type, wait_event, state, backend_xid, backend_xmin,
+       query_id, query, backend_type
+FROM pg_catalog.pg_stat_activity;

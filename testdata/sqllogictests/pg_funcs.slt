@@ -177,3 +177,70 @@ query T
 SELECT pg_tablespace_location(1663::bigint);
 ----
 (empty)
+
+# format_type(oid, typmod) — render the user-readable PG type name.
+# Was a NULL stub before this commit; DBeaver / PgJDBC / psycopg use
+# this for every column-type tooltip and `getColumns(...)` row.
+
+# Bare scalar OIDs → human-readable aliases.
+query T
+SELECT format_type(16::int, NULL::int);
+----
+boolean
+
+query T
+SELECT format_type(20::int, NULL::int);
+----
+bigint
+
+query T
+SELECT format_type(23::int, NULL::int);
+----
+integer
+
+query T
+SELECT format_type(701::int, NULL::int);
+----
+double precision
+
+query T
+SELECT format_type(25::int, NULL::int);
+----
+text
+
+# Unknown OID → '???' (matches real PG behaviour for missing pg_type
+# rows; better than NULL since drivers test the string non-empty).
+query T
+SELECT format_type(99999::int, NULL::int);
+----
+???
+
+# Varchar with length modifier — typmod is `length + 4`.
+query T
+SELECT format_type(1043::int, 14::int);
+----
+character varying(10)
+
+# bpchar (CHAR) with length.
+query T
+SELECT format_type(1042::int, 24::int);
+----
+character(20)
+
+# Timestamp with precision.
+query T
+SELECT format_type(1114::int, 3::int);
+----
+timestamp(3)
+
+# Negative typmod = no modifier (real PG uses -1 for unspecified).
+query T
+SELECT format_type(1043::int, -1::int);
+----
+character varying
+
+# Numeric without typmod → bare 'numeric'.
+query T
+SELECT format_type(1700::int, NULL::int);
+----
+numeric

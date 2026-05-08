@@ -1,0 +1,14 @@
+# `pg_catalog.pg_locks` — empty stub. pgAdmin / DataGrip issue
+# `SELECT *` against this on connect.
+
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_locks;
+----
+0
+
+# Column-shape probe — full PG 16 column list must be selectable.
+statement ok
+SELECT locktype, database, relation, page, tuple, virtualxid,
+       transactionid, classid, objid, objsubid, virtualtransaction,
+       pid, mode, granted, fastpath, waitstart
+FROM pg_catalog.pg_locks WHERE 1 <> 1;

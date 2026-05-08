@@ -567,16 +567,46 @@ impl BuiltinScalarUDF for PgVersion {
     }
 }
 
+/// Postgres `format_type(oid, int4) → text` — render an OID + typmod
+/// pair as the user-readable type name (`integer`, `character varying(6)`,
+/// `numeric(10,2)`).
+///
+/// Real PG drives DBeaver's column-type tooltip, the result-set type
+/// column in psql `\d+`, every `getColumns(...)` call in PgJDBC's
+/// `DatabaseMetaData`, and psycopg3's `TypeInfo` introspection. The
+/// previous NULL stub broke all of those: DBeaver shows `<unknown>`
+/// for every column.
+///
+/// Resolution:
+///   1. Look up the OID in `pgrepr::pg_type_oid::PG_TYPES` to get the
+///      `typname` (`int4`, `varchar`, `numeric`, ...).
+///   2. Apply the small set of human-readable aliases real PG uses
+///      (`int4` → `integer`, `int8` → `bigint`, `bool` → `boolean`,
+///      etc.).
+///   3. If `typmod >= 0`, decorate per type:
+///      - `varchar` / `bpchar`: `(typmod - 4)` length suffix.
+///      - `numeric`: precision/scale unpack from the packed typmod.
+///      - `time` / `timestamp` / `interval`: precision = typmod.
+///   4. NULL or negative typmod → bare type name.
+///
+/// Unknown OIDs return `???` — matches real Postgres behaviour for
+/// missing pg_type rows (better than NULL since drivers test the
+/// string non-empty).
 #[derive(Clone, Copy, Debug)]
 pub struct FormatType;
 
 impl ConstBuiltinFunction for FormatType {
     const NAME: &'static str = "format_type";
-    const DESCRIPTION: &'static str = "mock for postgres format_type";
-    const EXAMPLE: &'static str = "format_type(oid, int)";
+    const DESCRIPTION: &'static str =
+        "Render an OID + typmod pair as the user-readable Postgres type name (matches `pg_catalog.format_type`).";
+    const EXAMPLE: &'static str = "format_type(23, NULL) -- 'integer'";
     const FUNCTION_TYPE: FunctionType = FunctionType::Scalar;
 
     fn signature(&self) -> Option<Signature> {
+        // PG's signature is `(oid, integer)`. Drivers also call with
+        // `(oid, NULL::int)` and sometimes `(int4, NULL)` literally.
+        // Accept Int32 + Int32 (typmod nullable). PgJDBC sends the
+        // oid as `int4` after coercion.
         Some(Signature::exact(
             vec![DataType::Int32, DataType::Int32],
             Volatility::Stable,
@@ -584,9 +614,112 @@ impl ConstBuiltinFunction for FormatType {
     }
 }
 
+/// Map a Postgres `typname` (from the static `PG_TYPES` table) to the
+/// user-readable display string `format_type` returns. Only the names
+/// real PG aliases are listed; everything else passes through.
+fn pg_typname_to_display(typname: &str) -> &str {
+    match typname {
+        "bool" => "boolean",
+        "int2" => "smallint",
+        "int4" => "integer",
+        "int8" => "bigint",
+        "float4" => "real",
+        "float8" => "double precision",
+        "bpchar" => "character",
+        "varchar" => "character varying",
+        "timetz" => "time with time zone",
+        "timestamptz" => "timestamp with time zone",
+        other => other,
+    }
+}
+
+/// Format an OID + typmod pair the same way `pg_catalog.format_type`
+/// does in real PG. Returns `"???"` for unknown OIDs.
+fn format_type_inner(oid: i32, typmod: Option<i32>) -> String {
+    let info = match pgrepr::pg_type_oid::pg_type_by_oid(oid as u32) {
+        Some(info) => info,
+        None => return "???".to_string(),
+    };
+    let display = pg_typname_to_display(info.name);
+
+    // Decorate by type. Negative or NULL typmod means "no modifier".
+    let typmod = typmod.filter(|&m| m >= 0);
+    match (typname_kind(info.name), typmod) {
+        (TypMod::Varchar, Some(m)) => format!("{display}({})", m - 4),
+        (TypMod::Numeric, Some(m)) => {
+            // Packed typmod: (precision << 16) | scale, both biased
+            // by VARHDRSZ (4) — the standard pg_numeric_typmod_in
+            // shape. Unpack and render `numeric(p,s)`.
+            let unbiased = m - 4;
+            let precision = (unbiased >> 16) & 0xffff;
+            let scale = unbiased & 0xffff;
+            format!("numeric({precision},{scale})")
+        }
+        (TypMod::Time, Some(m)) => format!("{display}({m})"),
+        // No-typmod or unknown decoration — bare display name.
+        _ => display.to_string(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TypMod {
+    None,
+    Varchar,
+    Numeric,
+    Time,
+}
+
+fn typname_kind(typname: &str) -> TypMod {
+    match typname {
+        "varchar" | "bpchar" => TypMod::Varchar,
+        "numeric" => TypMod::Numeric,
+        "time" | "timetz" | "timestamp" | "timestamptz" | "interval" => TypMod::Time,
+        _ => TypMod::None,
+    }
+}
+
 impl BuiltinScalarUDF for FormatType {
-    fn try_as_expr(&self, _: &SessionCatalog, _: Vec<Expr>) -> DataFusionResult<Expr> {
-        Ok(Expr::Literal(ScalarValue::Null))
+    fn try_as_expr(&self, _: &SessionCatalog, args: Vec<Expr>) -> DataFusionResult<Expr> {
+        let return_type_fn: ReturnTypeFunction = Arc::new(|_| Ok(Arc::new(DataType::Utf8)));
+        let scalar_fn_impl: ScalarFunctionImplementation = Arc::new(move |input| {
+            // Two-arg call: (oid::int4, typmod::int4|NULL). The
+            // `get_nth_scalar_value` helper used elsewhere only reads
+            // one arg, so unpack manually and broadcast across the
+            // input's row count when scalars are supplied.
+            use datafusion::arrow::array::{Array, StringBuilder};
+            use datafusion::common::cast::as_int32_array;
+
+            let arrays = ColumnarValue::values_to_arrays(input)?;
+            let oid_arr = as_int32_array(&arrays[0])?;
+            let mod_arr = as_int32_array(&arrays[1])?;
+            let len = oid_arr.len();
+
+            let mut out = StringBuilder::with_capacity(len, len * 16);
+            for i in 0..len {
+                if oid_arr.is_null(i) {
+                    out.append_null();
+                    continue;
+                }
+                let oid = oid_arr.value(i);
+                let m = if mod_arr.is_null(i) {
+                    None
+                } else {
+                    Some(mod_arr.value(i))
+                };
+                out.append_value(format_type_inner(oid, m));
+            }
+            Ok(ColumnarValue::Array(Arc::new(out.finish())))
+        });
+        let udf = ScalarUDF::new(
+            Self::NAME,
+            &ConstBuiltinFunction::signature(self).unwrap(),
+            &return_type_fn,
+            &scalar_fn_impl,
+        );
+        Ok(Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::new(udf),
+            args,
+        )))
     }
     fn namespace(&self) -> FunctionNamespace {
         // psql `\dT` calls `pg_catalog.format_type(...)`; register under

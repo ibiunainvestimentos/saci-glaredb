@@ -1,0 +1,15 @@
+# `pg_catalog.pg_stats` — empty stub. DBeaver's Statistics tab
+# probes this; column shape per PG 16 system_views.sql.
+
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_stats;
+----
+0
+
+# Column-shape probe — 14-col PG 16 shape.
+statement ok
+SELECT schemaname, tablename, attname, inherited, null_frac,
+       avg_width, n_distinct, most_common_vals, most_common_freqs,
+       histogram_bounds, correlation, most_common_elems,
+       most_common_elem_freqs, elem_count_histogram
+FROM pg_catalog.pg_stats WHERE 1 <> 1;

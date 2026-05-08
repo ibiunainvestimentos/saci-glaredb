@@ -227,6 +227,12 @@ pub static GLARE_FUNCTIONS: Lazy<BuiltinTable> = Lazy::new(|| BuiltinTable {
             DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
             false,
         ),
+        // Pre-formatted oidvector wire shape for `pg_proc.proargtypes` —
+        // space-separated decimal OIDs (`"23 25 1043"`). Real Postgres'
+        // `proargtypes` is `oidvector`, parsed by PgJDBC's
+        // `getFunctionColumns` via `StringTokenizer`. NULL when the
+        // signature is non-`Exact` or arrow→OID resolution fails.
+        ("argument_oids_text", DataType::Utf8, true),
         // Arrow type name of the return value. NULL when the function does
         // not declare a fixed return type at registration time (most
         // DataFusion `ScalarUDF`s defer return-type inference to planning).
@@ -988,8 +994,15 @@ SELECT
         pg_catalog.pg_type_oid_by_name(f.return_type),
         CAST(0 AS INT)
     )                                          AS prorettype,
-    CAST(NULL AS TEXT)                         AS proargtypes,
-    CAST(NULL AS TEXT)                         AS proallargtypes,
+    -- Pre-formatted oidvector wire string from
+    -- `glare_catalog.functions.argument_oids_text` (populated at
+    -- dispatch time via `arrow_name_to_pg_oid`). PgJDBC's
+    -- `getFunctionColumns` runs `StringTokenizer` over this column
+    -- and yields one parameter row per token.
+    f.argument_oids_text                       AS proargtypes,
+    -- `proallargtypes` mirrors `proargtypes` since we don't
+    -- distinguish OUT/INOUT parameters today.
+    f.argument_oids_text                       AS proallargtypes,
     CAST(NULL AS TEXT)                         AS proargmodes,
     -- proargnames is `text[]` in real Postgres — argument *names*
     -- (NULL when the function uses positional-only args). The source
@@ -1060,6 +1073,21 @@ FROM (VALUES (1)) WHERE false",
 pub static PG_INDEX: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     schema: POSTGRES_SCHEMA,
     name: "pg_index",
+    // `indkey`, `indoption`, `indclass` are `int2vector` / `oidvector`
+    // upstream. Until we have a native int2vector Arrow type, project
+    // them as space-separated text:
+    //   - `indkey` carries the real per-column ordinals from
+    //     `glare_catalog.indexes.column_positions`.
+    //   - `indoption` is the per-key option bitmap; default `0` =
+    //     `ASC NULLS LAST`. We don't carry per-key options today, so
+    //     synthesize a `0` for each ordinal. Same idea for `indclass`
+    //     (per-key op-class oid; we don't have op-class metadata).
+    //
+    // Real PG drivers (PgJDBC `getIndexInfo`) wrap
+    // `information_schema._pg_expandarray(i.indkey)` around `indkey`
+    // and bitwise-AND `indoption[ord-1] & 1::smallint` for the ASC/
+    // DESC bit. The text form satisfies the SRF contract; the
+    // bitwise step is cosmetic and we report ASC NULLS LAST.
     sql: "
 SELECT
     i.oid               AS indexrelid,
@@ -1076,12 +1104,17 @@ SELECT
     true                AS indisready,
     true                AS indislive,
     false               AS indisreplident,
-    COALESCE(i.column_positions, '')        AS indkey,
-    CAST(NULL AS TEXT)                       AS indcollation,
-    CAST(NULL AS TEXT)                       AS indclass,
-    CAST(NULL AS TEXT)                       AS indoption,
-    i.expression                             AS indexprs,
-    i.predicate                              AS indpred
+    COALESCE(i.column_positions, '')                            AS indkey,
+    CAST(NULL AS TEXT)                                          AS indcollation,
+    -- Per-key op-class oid stub; one '0' per indkey ordinal. The
+    -- 'g' flag is critical — the 3-arg form replaces only the first
+    -- match, which would corrupt multi-key vectors (`'1 17 42'` →
+    -- `'0 17 42'` instead of `'0 0 0'`).
+    regexp_replace(COALESCE(i.column_positions, ''), '[0-9]+', '0', 'g') AS indclass,
+    -- Per-key option bitmap stub; '0' = ASC NULLS LAST.
+    regexp_replace(COALESCE(i.column_positions, ''), '[0-9]+', '0', 'g') AS indoption,
+    i.expression                                                AS indexprs,
+    i.predicate                                                 AS indpred
 FROM glare_catalog.indexes i",
 });
 
@@ -1112,8 +1145,16 @@ SELECT
     true                        AS conislocal,
     CAST(0 AS INT)              AS coninhcount,
     true                        AS connoinherit,
-    c.column_positions          AS conkey,
-    c.ref_column_positions      AS confkey,
+    -- `conkey` / `confkey` are `int2[]` upstream, formatted as the
+    -- Postgres array literal `{1,2,3}` on the wire. Convert from our
+    -- internal space-separated `column_positions` ('1 2 3') by
+    -- swapping spaces for commas and wrapping in braces. NULL-safe.
+    CASE WHEN c.column_positions IS NULL THEN NULL
+         ELSE '{' || replace(c.column_positions, ' ', ',') || '}'
+    END                         AS conkey,
+    CASE WHEN c.ref_column_positions IS NULL THEN NULL
+         ELSE '{' || replace(c.ref_column_positions, ' ', ',') || '}'
+    END                         AS confkey,
     CAST(NULL AS TEXT)          AS conpfeqop,
     CAST(NULL AS TEXT)          AS conppeqop,
     CAST(NULL AS TEXT)          AS conffeqop,
@@ -1463,6 +1504,469 @@ SELECT
 FROM (VALUES (1)) WHERE false",
 });
 
+// =============================================================================
+// New views shipped in the Postgres-spec compliance pass (Phase 4 / A8).
+//
+// HIGH PRIORITY — drivers fail or log SQLException without these:
+//   pg_indexes        — DBeaver Index tab
+//   pg_locks          — pgAdmin connect-time
+//   pg_stat_activity  — pgAdmin Dashboard
+//   pg_user / pg_shadow / pg_group — PgJDBC `getUserName`
+//   pg_stats          — DBeaver Statistics tab
+//
+// MEDIUM PRIORITY — empty-stub forms; psql `\d+`, pgAdmin Dashboard,
+// ad-hoc tooling probe these and silently disable features when missing:
+//   pg_stat_user_tables, pg_stat_user_indexes, pg_statio_user_tables,
+//   pg_publication_tables, pg_partitioned_table, pg_policy,
+//   pg_seclabel, pg_shseclabel, pg_init_privs, pg_largeobject,
+//   pg_largeobject_metadata, pg_timezone_names, pg_timezone_abbrevs,
+//   pg_prepared_statements, pg_cursors, pg_user_mappings, pg_rules,
+//   pg_policies, pg_sequences.
+// =============================================================================
+
+/// `pg_indexes` — joins pg_index ↔ pg_class ↔ pg_namespace ↔
+/// pg_tablespace. DBeaver's Index tab issues `SELECT *` against this.
+/// Today `glare_catalog.indexes` is empty, so the join is empty too,
+/// but the column shape is the contract.
+pub static PG_INDEXES: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_indexes",
+    sql: "
+SELECT
+    n.nspname                       AS schemaname,
+    c.relname                       AS tablename,
+    ic.relname                      AS indexname,
+    CAST(NULL AS TEXT)              AS tablespace,
+    pg_catalog.pg_get_indexdef(i.indexrelid) AS indexdef
+FROM pg_catalog.pg_index i
+JOIN pg_catalog.pg_class c  ON c.oid  = i.indrelid
+JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace",
+});
+
+/// `pg_locks` — empty stub. pgAdmin / DataGrip issue `SELECT *` at
+/// connect; column shape per PG 16 catalog/lock.c output.
+pub static PG_LOCKS: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_locks",
+    sql: "
+SELECT
+    CAST(NULL AS TEXT)        AS locktype,
+    CAST(NULL AS INT)         AS database,
+    CAST(NULL AS INT)         AS relation,
+    CAST(NULL AS INT)         AS page,
+    CAST(NULL AS SMALLINT)    AS tuple,
+    CAST(NULL AS TEXT)        AS virtualxid,
+    CAST(NULL AS BIGINT)      AS transactionid,
+    CAST(NULL AS INT)         AS classid,
+    CAST(NULL AS INT)         AS objid,
+    CAST(NULL AS SMALLINT)    AS objsubid,
+    CAST(NULL AS TEXT)        AS virtualtransaction,
+    CAST(NULL AS INT)         AS pid,
+    CAST(NULL AS TEXT)        AS mode,
+    CAST(NULL AS BOOLEAN)     AS granted,
+    CAST(NULL AS BOOLEAN)     AS fastpath,
+    CAST(NULL AS TIMESTAMP)   AS waitstart
+FROM (VALUES (1)) WHERE false",
+});
+
+/// `pg_stat_activity` — single-row stub for the current session.
+/// pgAdmin's Dashboard breaks if this is empty.
+pub static PG_STAT_ACTIVITY: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_stat_activity",
+    sql: "
+SELECT
+    CAST(0 AS INT)            AS datid,
+    current_database()        AS datname,
+    CAST(0 AS INT)            AS pid,
+    CAST(NULL AS INT)         AS leader_pid,
+    CAST(10 AS INT)           AS usesysid,
+    'glaredb'                 AS usename,
+    CAST(NULL AS TEXT)        AS application_name,
+    CAST(NULL AS TEXT)        AS client_addr,
+    CAST(NULL AS TEXT)        AS client_hostname,
+    CAST(NULL AS INT)         AS client_port,
+    CAST(NULL AS TIMESTAMP)   AS backend_start,
+    CAST(NULL AS TIMESTAMP)   AS xact_start,
+    CAST(NULL AS TIMESTAMP)   AS query_start,
+    CAST(NULL AS TIMESTAMP)   AS state_change,
+    CAST(NULL AS TEXT)        AS wait_event_type,
+    CAST(NULL AS TEXT)        AS wait_event,
+    'active'                  AS state,
+    CAST(NULL AS BIGINT)      AS backend_xid,
+    CAST(NULL AS BIGINT)      AS backend_xmin,
+    CAST(NULL AS BIGINT)      AS query_id,
+    CAST('' AS TEXT)          AS query,
+    'client backend'          AS backend_type",
+});
+
+/// `pg_user` — view over `pg_authid` (per upstream system_views.sql).
+/// PgJDBC's `DatabaseMetaData.getUserName()` issues
+/// `SELECT usename FROM pg_user WHERE usesysid = …`.
+pub static PG_USER: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_user",
+    sql: "
+SELECT
+    rolname                AS usename,
+    oid                    AS usesysid,
+    rolcreatedb            AS usecreatedb,
+    rolsuper               AS usesuper,
+    rolreplication         AS userepl,
+    rolbypassrls           AS usebypassrls,
+    CAST('********' AS TEXT) AS passwd,
+    CAST(NULL AS TIMESTAMP) AS valuntil,
+    CAST(NULL AS TEXT)     AS useconfig
+FROM pg_catalog.pg_authid
+WHERE rolcanlogin = true",
+});
+
+/// `pg_shadow` — same shape as pg_user, restricted to login roles.
+/// Mirrors upstream system_views.sql.
+pub static PG_SHADOW: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_shadow",
+    sql: "
+SELECT
+    rolname                AS usename,
+    oid                    AS usesysid,
+    rolcreatedb            AS usecreatedb,
+    rolsuper               AS usesuper,
+    rolreplication         AS userepl,
+    rolbypassrls           AS usebypassrls,
+    CAST('********' AS TEXT) AS passwd,
+    CAST(NULL AS TIMESTAMP) AS valuntil,
+    CAST(NULL AS TEXT)     AS useconfig
+FROM pg_catalog.pg_authid
+WHERE rolcanlogin = true",
+});
+
+/// `pg_group` — view over `pg_authid` for non-login roles. Empty in
+/// practice (we only ship one role).
+pub static PG_GROUP: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_group",
+    sql: "
+SELECT
+    rolname                AS groname,
+    oid                    AS grosysid,
+    CAST(NULL AS TEXT)     AS grolist
+FROM pg_catalog.pg_authid
+WHERE rolcanlogin = false",
+});
+
+/// `pg_stats` — empty stub. DBeaver's Statistics tab issues
+/// `SELECT *` here when expanding a column-level view.
+pub static PG_STATS: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_stats",
+    sql: "
+SELECT
+    CAST(NULL AS TEXT)     AS schemaname,
+    CAST(NULL AS TEXT)     AS tablename,
+    CAST(NULL AS TEXT)     AS attname,
+    CAST(NULL AS BOOLEAN)  AS inherited,
+    CAST(NULL AS REAL)     AS null_frac,
+    CAST(NULL AS INT)      AS avg_width,
+    CAST(NULL AS REAL)     AS n_distinct,
+    CAST(NULL AS TEXT)     AS most_common_vals,
+    CAST(NULL AS TEXT)     AS most_common_freqs,
+    CAST(NULL AS TEXT)     AS histogram_bounds,
+    CAST(NULL AS REAL)     AS correlation,
+    CAST(NULL AS TEXT)     AS most_common_elems,
+    CAST(NULL AS TEXT)     AS most_common_elem_freqs,
+    CAST(NULL AS TEXT)     AS elem_count_histogram
+FROM (VALUES (1)) WHERE false",
+});
+
+// ---------- Medium priority — empty stubs ----------
+
+pub static PG_STAT_USER_TABLES: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_stat_user_tables",
+    sql: "
+SELECT
+    CAST(NULL AS INT)     AS relid,
+    CAST(NULL AS TEXT)    AS schemaname,
+    CAST(NULL AS TEXT)    AS relname,
+    CAST(NULL AS BIGINT)  AS seq_scan,
+    CAST(NULL AS BIGINT)  AS seq_tup_read,
+    CAST(NULL AS BIGINT)  AS idx_scan,
+    CAST(NULL AS BIGINT)  AS idx_tup_fetch,
+    CAST(NULL AS BIGINT)  AS n_tup_ins,
+    CAST(NULL AS BIGINT)  AS n_tup_upd,
+    CAST(NULL AS BIGINT)  AS n_tup_del,
+    CAST(NULL AS BIGINT)  AS n_tup_hot_upd,
+    CAST(NULL AS BIGINT)  AS n_live_tup,
+    CAST(NULL AS BIGINT)  AS n_dead_tup,
+    CAST(NULL AS BIGINT)  AS n_mod_since_analyze,
+    CAST(NULL AS BIGINT)  AS n_ins_since_vacuum,
+    CAST(NULL AS TIMESTAMP) AS last_vacuum,
+    CAST(NULL AS TIMESTAMP) AS last_autovacuum,
+    CAST(NULL AS TIMESTAMP) AS last_analyze,
+    CAST(NULL AS TIMESTAMP) AS last_autoanalyze,
+    CAST(NULL AS BIGINT)  AS vacuum_count,
+    CAST(NULL AS BIGINT)  AS autovacuum_count,
+    CAST(NULL AS BIGINT)  AS analyze_count,
+    CAST(NULL AS BIGINT)  AS autoanalyze_count
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_STAT_USER_INDEXES: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_stat_user_indexes",
+    sql: "
+SELECT
+    CAST(NULL AS INT)     AS relid,
+    CAST(NULL AS INT)     AS indexrelid,
+    CAST(NULL AS TEXT)    AS schemaname,
+    CAST(NULL AS TEXT)    AS relname,
+    CAST(NULL AS TEXT)    AS indexrelname,
+    CAST(NULL AS BIGINT)  AS idx_scan,
+    CAST(NULL AS BIGINT)  AS idx_tup_read,
+    CAST(NULL AS BIGINT)  AS idx_tup_fetch
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_STATIO_USER_TABLES: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_statio_user_tables",
+    sql: "
+SELECT
+    CAST(NULL AS INT)     AS relid,
+    CAST(NULL AS TEXT)    AS schemaname,
+    CAST(NULL AS TEXT)    AS relname,
+    CAST(NULL AS BIGINT)  AS heap_blks_read,
+    CAST(NULL AS BIGINT)  AS heap_blks_hit,
+    CAST(NULL AS BIGINT)  AS idx_blks_read,
+    CAST(NULL AS BIGINT)  AS idx_blks_hit,
+    CAST(NULL AS BIGINT)  AS toast_blks_read,
+    CAST(NULL AS BIGINT)  AS toast_blks_hit,
+    CAST(NULL AS BIGINT)  AS tidx_blks_read,
+    CAST(NULL AS BIGINT)  AS tidx_blks_hit
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_PUBLICATION_TABLES: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_publication_tables",
+    sql: "
+SELECT
+    CAST(NULL AS TEXT)    AS pubname,
+    CAST(NULL AS TEXT)    AS schemaname,
+    CAST(NULL AS TEXT)    AS tablename,
+    CAST(NULL AS TEXT)    AS attnames,
+    CAST(NULL AS TEXT)    AS rowfilter
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_PARTITIONED_TABLE: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_partitioned_table",
+    sql: "
+SELECT
+    CAST(NULL AS INT)     AS partrelid,
+    CAST(NULL AS TEXT)    AS partstrat,
+    CAST(NULL AS SMALLINT) AS partnatts,
+    CAST(NULL AS INT)     AS partdefid,
+    CAST(NULL AS TEXT)    AS partattrs,
+    CAST(NULL AS TEXT)    AS partclass,
+    CAST(NULL AS TEXT)    AS partcollation,
+    CAST(NULL AS TEXT)    AS partexprs
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_POLICY: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_policy",
+    sql: "
+SELECT
+    CAST(NULL AS INT)     AS oid,
+    CAST(NULL AS TEXT)    AS polname,
+    CAST(NULL AS INT)     AS polrelid,
+    CAST(NULL AS TEXT)    AS polcmd,
+    CAST(NULL AS BOOLEAN) AS polpermissive,
+    CAST(NULL AS TEXT)    AS polroles,
+    CAST(NULL AS TEXT)    AS polqual,
+    CAST(NULL AS TEXT)    AS polwithcheck
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_POLICIES: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_policies",
+    sql: "
+SELECT
+    CAST(NULL AS TEXT)    AS schemaname,
+    CAST(NULL AS TEXT)    AS tablename,
+    CAST(NULL AS TEXT)    AS policyname,
+    CAST(NULL AS TEXT)    AS permissive,
+    CAST(NULL AS TEXT)    AS roles,
+    CAST(NULL AS TEXT)    AS cmd,
+    CAST(NULL AS TEXT)    AS qual,
+    CAST(NULL AS TEXT)    AS with_check
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_SECLABEL: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_seclabel",
+    sql: "
+SELECT
+    CAST(NULL AS INT)     AS objoid,
+    CAST(NULL AS INT)     AS classoid,
+    CAST(NULL AS INT)     AS objsubid,
+    CAST(NULL AS TEXT)    AS provider,
+    CAST(NULL AS TEXT)    AS label
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_SHSECLABEL: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_shseclabel",
+    sql: "
+SELECT
+    CAST(NULL AS INT)     AS objoid,
+    CAST(NULL AS INT)     AS classoid,
+    CAST(NULL AS TEXT)    AS provider,
+    CAST(NULL AS TEXT)    AS label
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_INIT_PRIVS: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_init_privs",
+    sql: "
+SELECT
+    CAST(NULL AS INT)     AS objoid,
+    CAST(NULL AS INT)     AS classoid,
+    CAST(NULL AS INT)     AS objsubid,
+    CAST(NULL AS TEXT)    AS privtype,
+    CAST(NULL AS TEXT)    AS initprivs
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_LARGEOBJECT: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_largeobject",
+    sql: "
+SELECT
+    CAST(NULL AS INT)     AS loid,
+    CAST(NULL AS INT)     AS pageno,
+    CAST(NULL AS TEXT)    AS data
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_LARGEOBJECT_METADATA: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_largeobject_metadata",
+    sql: "
+SELECT
+    CAST(NULL AS INT)     AS oid,
+    CAST(NULL AS INT)     AS lomowner,
+    CAST(NULL AS TEXT)    AS lomacl
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_TIMEZONE_NAMES: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_timezone_names",
+    // DBeaver Settings → Time Zone picker. Empty stub fine.
+    sql: "
+SELECT
+    CAST(NULL AS TEXT)     AS name,
+    CAST(NULL AS TEXT)     AS abbrev,
+    CAST(NULL AS INTERVAL) AS utc_offset,
+    CAST(NULL AS BOOLEAN)  AS is_dst
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_TIMEZONE_ABBREVS: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_timezone_abbrevs",
+    sql: "
+SELECT
+    CAST(NULL AS TEXT)     AS abbrev,
+    CAST(NULL AS INTERVAL) AS utc_offset,
+    CAST(NULL AS BOOLEAN)  AS is_dst
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_PREPARED_STATEMENTS: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_prepared_statements",
+    sql: "
+SELECT
+    CAST(NULL AS TEXT)      AS name,
+    CAST(NULL AS TEXT)      AS statement,
+    CAST(NULL AS TIMESTAMP) AS prepare_time,
+    CAST(NULL AS TEXT)      AS parameter_types,
+    CAST(NULL AS BOOLEAN)   AS from_sql,
+    CAST(NULL AS BIGINT)    AS generic_plans,
+    CAST(NULL AS BIGINT)    AS custom_plans
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_CURSORS: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_cursors",
+    sql: "
+SELECT
+    CAST(NULL AS TEXT)      AS name,
+    CAST(NULL AS TEXT)      AS statement,
+    CAST(NULL AS BOOLEAN)   AS is_holdable,
+    CAST(NULL AS BOOLEAN)   AS is_binary,
+    CAST(NULL AS BOOLEAN)   AS is_scrollable,
+    CAST(NULL AS TIMESTAMP) AS creation_time
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_USER_MAPPINGS: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_user_mappings",
+    sql: "
+SELECT
+    CAST(NULL AS INT)     AS umid,
+    CAST(NULL AS INT)     AS srvid,
+    CAST(NULL AS TEXT)    AS srvname,
+    CAST(NULL AS INT)     AS umuser,
+    CAST(NULL AS TEXT)    AS usename,
+    CAST(NULL AS TEXT)    AS umoptions
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_RULES: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_rules",
+    sql: "
+SELECT
+    CAST(NULL AS TEXT)    AS schemaname,
+    CAST(NULL AS TEXT)    AS tablename,
+    CAST(NULL AS TEXT)    AS rulename,
+    CAST(NULL AS TEXT)    AS definition
+FROM (VALUES (1)) WHERE false",
+});
+
+pub static PG_SEQUENCES: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_sequences",
+    sql: "
+SELECT
+    CAST(NULL AS TEXT)    AS schemaname,
+    CAST(NULL AS TEXT)    AS sequencename,
+    CAST(NULL AS TEXT)    AS sequenceowner,
+    CAST(NULL AS TEXT)    AS data_type,
+    CAST(NULL AS BIGINT)  AS start_value,
+    CAST(NULL AS BIGINT)  AS min_value,
+    CAST(NULL AS BIGINT)  AS max_value,
+    CAST(NULL AS BIGINT)  AS increment_by,
+    CAST(NULL AS BOOLEAN) AS cycle,
+    CAST(NULL AS BIGINT)  AS cache_size,
+    CAST(NULL AS BIGINT)  AS last_value
+FROM (VALUES (1)) WHERE false",
+});
+
 pub static PG_SUBSCRIPTION: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     schema: POSTGRES_SCHEMA,
     name: "pg_subscription",
@@ -1512,19 +2016,45 @@ impl BuiltinView {
             &PG_LANGUAGE,
             &PG_MATVIEWS,
             &PG_NAMESPACE,
+            &PG_PARTITIONED_TABLE,
             &PG_PROC,
+            &PG_CURSORS,
+            &PG_GROUP,
+            &PG_INDEXES,
+            &PG_INIT_PRIVS,
+            &PG_LARGEOBJECT,
+            &PG_LARGEOBJECT_METADATA,
+            &PG_LOCKS,
+            &PG_POLICIES,
+            &PG_POLICY,
+            &PG_PREPARED_STATEMENTS,
             &PG_PUBLICATION,
+            &PG_PUBLICATION_TABLES,
             &PG_RANGE,
             &PG_REPLICATION_SLOTS,
             &PG_REWRITE,
             &PG_ROLES,
+            &PG_RULES,
+            &PG_SECLABEL,
+            &PG_SEQUENCES,
             &PG_SETTINGS,
+            &PG_SHADOW,
             &PG_SHDESCRIPTION,
+            &PG_SHSECLABEL,
+            &PG_STAT_ACTIVITY,
+            &PG_STAT_USER_INDEXES,
+            &PG_STAT_USER_TABLES,
+            &PG_STATIO_USER_TABLES,
+            &PG_STATS,
             &PG_SUBSCRIPTION,
             &PG_TABLES,
             &PG_TABLESPACE,
+            &PG_TIMEZONE_ABBREVS,
+            &PG_TIMEZONE_NAMES,
             &PG_TRIGGER,
             &PG_TYPE,
+            &PG_USER,
+            &PG_USER_MAPPINGS,
             &PG_VIEWS,
         ]
     }
