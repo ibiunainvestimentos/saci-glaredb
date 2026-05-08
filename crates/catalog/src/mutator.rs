@@ -102,15 +102,50 @@ impl CatalogMutator {
     /// Errors if the metastore client isn't configured.
     ///
     /// This will retry mutations if we were working with an out of date
-    /// catalog.
+    /// catalog. The retry is bounded so concurrent writers can't loop
+    /// forever on a hot key.
     pub async fn mutate_and_commit(
         &self,
         catalog_version: u64,
         mutations: impl IntoIterator<Item = Mutation>,
     ) -> Result<Arc<CatalogState>> {
-        let state = self.mutate(catalog_version, mutations).await?;
-        self.commit_state(catalog_version, state.as_ref().clone())
-            .await
+        let mutations: Vec<_> = mutations.into_iter().collect();
+        let mut version = catalog_version;
+        let mut attempt = 0u32;
+        const MAX_ATTEMPTS: u32 = 5;
+        loop {
+            // `mutate` itself retries on `try_mutate` rejection (FetchCatalogAndRetry),
+            // so by the time we reach commit_state the in-memory state is rebased
+            // on the freshest catalog version `mutate` saw. The race we're
+            // catching here is when *another* session commits AFTER our `mutate`
+            // but BEFORE our `commit_state` lands — the commit_state then fails
+            // with stale-version. We re-fetch and replay from the top.
+            let state = self.mutate(version, mutations.clone()).await?;
+            match self
+                .commit_state(version, state.as_ref().clone())
+                .await
+            {
+                Ok(state) => return Ok(state),
+                Err(CatalogError {
+                    msg,
+                    strategy: Some(ResolveErrorStrategy::FetchCatalogAndRetry),
+                }) if attempt + 1 < MAX_ATTEMPTS => {
+                    attempt += 1;
+                    debug!(
+                        attempt,
+                        error_message = msg,
+                        "commit_state lost a race; refreshing catalog and replaying mutations"
+                    );
+                    let client = self.client.as_ref().ok_or_else(|| {
+                        CatalogError::new("metastore client not configured")
+                    })?;
+                    client.refresh_cached_state().await?;
+                    let fresh = client.get_cached_state().await?;
+                    version = fresh.version;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 

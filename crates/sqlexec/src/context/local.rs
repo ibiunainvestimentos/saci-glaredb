@@ -68,6 +68,13 @@ pub struct LocalSessionContext {
     prepared: HashMap<String, PreparedStatement>,
     /// Bound portals.
     portals: HashMap<String, Portal>,
+    /// Set by `force_refresh_state` after a DDL invalidates the catalog
+    /// snapshot the session's cached plans were built against. The next
+    /// `prepare_statement` call reads + clears this flag and drops all
+    /// cached `PreparedStatement` / `Portal` entries — ensuring the
+    /// next Parse/Bind cycle re-plans against the freshly-swapped
+    /// catalog instead of replaying a frozen pre-DDL plan.
+    cache_invalidated: bool,
     /// Handler to push metrics into tracker.
     metrics_handler: SessionMetricsHandler,
     /// Datafusion session context used for planning and execution.
@@ -122,6 +129,7 @@ impl LocalSessionContext {
             tables: native_tables,
             prepared: HashMap::new(),
             portals: HashMap::new(),
+            cache_invalidated: false,
             metrics_handler,
             df_ctx,
             env_reader: None,
@@ -295,13 +303,25 @@ impl LocalSessionContext {
     /// session sees its own writes — the default `maybe_refresh_state`
     /// path races the metastore worker's `version_hint` AtomicU64
     /// store and may no-op even though the metastore has the latest.
+    ///
+    /// Marks the session's prepared-statement cache stale so the next
+    /// `prepare_statement` invocation drops cached plans before
+    /// rebuilding. We can't clear here directly: this hook fires
+    /// *during* the current Execute's stream, before the simple-query
+    /// path reads back the unnamed portal — wiping `self.portals`
+    /// mid-flight breaks the in-flight COMMENT response. The deferred
+    /// clear happens at the top of the next Parse/Bind cycle, which
+    /// is exactly when a stale plan would otherwise be reused.
     pub async fn force_refresh_state(&mut self) -> Result<()> {
         let mutator = self.catalog_mutator();
         let client = mutator.get_metastore_client();
         self.catalog
             .maybe_refresh_state(client, /* force_refresh = */ true)
             .await
-            .map_err(ExecError::from)
+            .map_err(ExecError::from)?;
+
+        self.cache_invalidated = true;
+        Ok(())
     }
 
     /// Create a prepared statement.
@@ -313,6 +333,13 @@ impl LocalSessionContext {
     ) -> Result<()> {
         // Refresh the cached catalog state if necessary
         self.maybe_refresh_state().await?;
+
+        // The freshly-built PreparedStatement below is planned against
+        // the just-refreshed catalog so it's already correct — no need
+        // to touch `cache_invalidated` here. The flag is consumed in
+        // `bind_statement`, which is the only path asyncpg drives when
+        // it reuses an already-Parsed prepared statement (its default
+        // behaviour for repeated identical SQL).
 
         // Unnamed (empty string) prepared statements can be overwritten
         // whenever. Named prepared statements must be explicitly removed before
@@ -335,7 +362,7 @@ impl LocalSessionContext {
     /// Internally this will create a logical plan for the statement and store
     /// that on the portal.
     // TODO: Accept parameters.
-    pub fn bind_statement(
+    pub async fn bind_statement(
         &mut self,
         portal_name: String,
         stmt_name: &str,
@@ -349,6 +376,39 @@ impl LocalSessionContext {
                 "named portals must be deallocated before reuse, name: {}",
                 portal_name,
             ));
+        }
+
+        // If the post-DDL hook flagged the prepared cache as stale,
+        // re-plan the cached PreparedStatement here so the portal
+        // doesn't replay a frozen pre-DDL plan. This catches asyncpg's
+        // reuse pattern: for repeated identical SQL it sends Bind
+        // without a fresh Parse, so `prepare_statement`'s flag-check
+        // never fires. The re-plan path runs the SessionPlanner
+        // against the *current* SessionCatalog (already swapped in
+        // force_refresh_state), then writes the freshly-planned PS
+        // back into `self.prepared` before cloning into the portal.
+        if self.cache_invalidated {
+            self.cache_invalidated = false;
+            // Drop NAMED portals only — the unnamed portal of an
+            // in-flight DDL response is also bound during this same
+            // execute frame and we don't want to wipe it. Named
+            // portals are how clients (asyncpg) refer to long-lived
+            // bindings and they can be safely re-bound on demand.
+            self.portals.retain(|name, _| name.is_empty());
+
+            let stmt_names: Vec<String> = self.prepared.keys().cloned().collect();
+            for name in stmt_names {
+                let inner_stmt = match self
+                    .prepared
+                    .get(&name)
+                    .and_then(|p| p.stmt.as_ref().cloned())
+                {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let fresh = PreparedStatement::build(Some(inner_stmt), self).await?;
+                self.prepared.insert(name, fresh);
+            }
         }
 
         let mut stmt = match self.prepared.get(stmt_name) {

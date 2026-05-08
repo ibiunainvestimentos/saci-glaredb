@@ -557,7 +557,8 @@ impl Session {
             portal_id,
             Vec::new(),
             vec![Format::Text; num_fields],
-        )?;
+        )
+        .await?;
         Ok(())
     }
 
@@ -589,7 +590,7 @@ impl Session {
     ///
     /// If successful, the bound statement will create a portal which can be
     /// used to execute the statement.
-    pub fn bind_statement(
+    pub async fn bind_statement(
         &mut self,
         portal_name: String,
         stmt_name: &str,
@@ -598,6 +599,7 @@ impl Session {
     ) -> Result<()> {
         self.ctx
             .bind_statement(portal_name, stmt_name, params, result_formats)
+            .await
     }
 
     /// Execute a logical plan.
@@ -793,7 +795,8 @@ impl Session {
                     &UNNAMED,
                     Vec::new(),
                     vec![Format::Text; num_fields],
-                )?;
+                )
+                .await?;
                 let portal = self.ctx.get_portal(&UNNAMED)?.clone();
                 Ok(portal.stmt.plan.unwrap())
             }

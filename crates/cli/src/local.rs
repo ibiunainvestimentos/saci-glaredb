@@ -221,12 +221,14 @@ impl LocalSession {
                 .await?;
             let prepared = self.sess.get_prepared_statement(&UNNAMED)?;
             let num_fields = prepared.output_fields().map(|f| f.len()).unwrap_or(0);
-            self.sess.bind_statement(
-                UNNAMED,
-                &UNNAMED,
-                Vec::new(),
-                vec![Format::Text; num_fields],
-            )?;
+            self.sess
+                .bind_statement(
+                    UNNAMED,
+                    &UNNAMED,
+                    Vec::new(),
+                    vec![Format::Text; num_fields],
+                )
+                .await?;
 
             let stream = self.sess.execute_portal(&UNNAMED, 0).await?;
 

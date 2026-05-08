@@ -986,15 +986,16 @@ SELECT
     CAST(NULL AS TEXT)                         AS proargtypes,
     CAST(NULL AS TEXT)                         AS proallargtypes,
     CAST(NULL AS TEXT)                         AS proargmodes,
-    -- proargnames is a `text[]` in real Postgres. The source column
-    -- `f.parameters` is `List<Utf8>`, which the pgwire layer
-    -- serialises as a JSON literal (`[..]`) — wrong shape for asyncpg
-    -- / JDBC introspection. Format it as a PG-array text literal
-    -- (`{a,b,c}`) so the announced text type is what tools expect.
-    CASE
-        WHEN cardinality(f.parameters) = 0 THEN CAST('{}' AS TEXT)
-        ELSE '{' || array_to_string(f.parameters, ',') || '}'
-    END                                        AS proargnames,
+    -- proargnames is `text[]` in real Postgres — argument *names*
+    -- (NULL when the function uses positional-only args). The source
+    -- column `glare_catalog.functions.parameters` actually stores
+    -- type-signature strings (`Int8/Int16/...`), not parameter names,
+    -- so emitting them here would be a lie that confuses introspection
+    -- tools. Real Postgres returns NULL for builtins without recorded
+    -- argument names; we do the same. (When DataFusion eventually
+    -- exposes real argument names on `ScalarUDF`, swap this for the
+    -- proper text-array projection.)
+    CAST(NULL AS TEXT)                         AS proargnames,
     CAST(NULL AS TEXT)                         AS proargdefaults,
     CAST(NULL AS TEXT)                         AS protrftypes,
     COALESCE(f.example, '')                    AS prosrc,

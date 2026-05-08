@@ -343,11 +343,37 @@ impl StatefulWorker {
                     catalog: Some(state.try_into().unwrap()),
                 });
 
-                let result = self.client.commit_catalog(commit_request).await.unwrap();
-                let result = result.into_inner();
-                let state: CatalogState = result.catalog.unwrap().try_into().unwrap();
-                self.set_cached_state(state);
-                let res = Ok(self.cached_state.clone());
+                // Recoverable failures here (most commonly an out-of-date
+                // catalog_version when two sessions race a commit) used to
+                // panic the worker via `.unwrap()`, which closed both the
+                // request mpsc and every in-flight oneshot — surfacing in
+                // peer sessions as `request channel closed` /
+                // `response channel closed` on the next catalog op. Now we
+                // map the tonic::Status into a CatalogError; the existing
+                // `From<tonic::Status>` impl in catalog::errors carries the
+                // metastore's `resolve-error-strategy` metadata header
+                // through, so the mutator's FetchCatalogAndRetry path
+                // (CatalogMutator::mutate) kicks in automatically.
+                let res = match self.client.commit_catalog(commit_request).await {
+                    Ok(result) => {
+                        let result = result.into_inner();
+                        let decoded = result.catalog.ok_or_else(|| {
+                            CatalogError::new(
+                                "metastore returned empty catalog on commit",
+                            )
+                        });
+                        match decoded.and_then(|c| {
+                            CatalogState::try_from(c).map_err(CatalogError::from)
+                        }) {
+                            Ok(state) => {
+                                self.set_cached_state(state);
+                                Ok(self.cached_state.clone())
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Err(status) => Err(CatalogError::from(status)),
+                };
 
                 if response.send(res).is_err() {
                     error!("failed to respond to commit");

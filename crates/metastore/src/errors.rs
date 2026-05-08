@@ -121,6 +121,15 @@ impl From<MetastoreError> for tonic::Status {
         // error itself without the user being notified.
         let strat = match &value {
             MetastoreError::VersionMismatch { .. } => ResolveErrorStrategy::FetchCatalogAndRetry,
+            // The on-disk persistence layer signals a stale write through
+            // `StorageError::AttemptedOutOfDataCatalogWrite` (note the
+            // upstream typo "OutOfData"). It's the same race as
+            // `VersionMismatch` — a peer session committed between our
+            // mutate and our commit_state — so the client can recover by
+            // refreshing and replaying.
+            MetastoreError::Storage(crate::storage::StorageError::AttemptedOutOfDataCatalogWrite { .. }) => {
+                ResolveErrorStrategy::FetchCatalogAndRetry
+            }
             _ => ResolveErrorStrategy::Unknown,
         };
 

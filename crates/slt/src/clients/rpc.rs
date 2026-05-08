@@ -66,12 +66,14 @@ impl AsyncDB for RpcTestClient {
             session.prepare_statement(UNNAMED, stmt, Vec::new()).await?;
             let prepared = session.get_prepared_statement(&UNNAMED)?;
             let num_fields = prepared.output_fields().map(|f| f.len()).unwrap_or(0);
-            session.bind_statement(
-                UNNAMED,
-                &UNNAMED,
-                Vec::new(),
-                vec![Format::Text; num_fields],
-            )?;
+            session
+                .bind_statement(
+                    UNNAMED,
+                    &UNNAMED,
+                    Vec::new(),
+                    vec![Format::Text; num_fields],
+                )
+                .await?;
             let stream = session.execute_portal(&UNNAMED, 0).await?;
 
             match stream {

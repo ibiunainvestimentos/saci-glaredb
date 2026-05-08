@@ -690,8 +690,9 @@ where
             );
 
             // Bind...
-            if let Err(e) =
-                session.bind_statement(UNNAMED, &UNNAMED, Vec::new(), all_text_formats(num_fields))
+            if let Err(e) = session
+                .bind_statement(UNNAMED, &UNNAMED, Vec::new(), all_text_formats(num_fields))
+                .await
             {
                 self.send_error(e.into()).await?;
                 return self.ready_for_query().await;
@@ -855,6 +856,7 @@ where
         match self
             .session
             .bind_statement(portal, &statement, scalars, result_formats)
+            .await
         {
             Ok(_) => self.conn.send(BackendMessage::BindComplete).await,
             Err(e) => self.send_error(e.into()).await,

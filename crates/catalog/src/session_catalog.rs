@@ -313,7 +313,18 @@ impl SessionCatalog {
 
         if force_refresh {
             debug!("refreshed cached catalog state as per force_catalog_refresh");
-            client.refresh_cached_state().await?;
+            // refresh_cached_state issues a fetch_catalog gRPC against the
+            // metastore. In single-node / local-session mode the metastore
+            // worker handles this in-process. If the worker's request
+            // channel is closed (e.g. transient init race in the dev
+            // stack), the next-best thing is to skip the refresh and rely
+            // on `version_hint` — which the worker bumps synchronously
+            // inside `set_cached_state` at commit time, so a just-
+            // committed mutation IS visible via `get_cached_state` even
+            // when the explicit refresh round-trip can't complete.
+            if let Err(e) = client.refresh_cached_state().await {
+                debug!(?e, "refresh_cached_state failed; falling through to version_hint check");
+            }
         }
 
         // Swap out cached catalog if a newer one was fetched.
