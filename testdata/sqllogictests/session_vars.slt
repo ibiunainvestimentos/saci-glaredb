@@ -50,7 +50,7 @@ ISO, MDY
 query T
 SHOW standard_conforming_strings;
 ----
-true
+on
 
 # `SET session authorization` should be accepted (no-op enforcement; we just
 # stash the value so DBeaver / JDBC can read it back).

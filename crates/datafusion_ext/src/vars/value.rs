@@ -29,15 +29,28 @@ impl Value for String {
 
 impl Value for bool {
     fn try_parse(s: &str) -> Option<Self::Owned> {
-        match s {
-            "t" | "true" => Some(true),
-            "f" | "false" => Some(false),
+        // Match Postgres `parse_bool` semantics — GUC SETs accept any of
+        // these forms, case-insensitively. Critical for round-trips with
+        // PgJDBC / psql, which write `on`/`off` and read it back.
+        match s.to_ascii_lowercase().as_str() {
+            "t" | "true" | "on" | "yes" | "1" => Some(true),
+            "f" | "false" | "off" | "no" | "0" => Some(false),
             _ => None,
         }
     }
 
     fn format(&self) -> String {
-        self.to_string()
+        // Postgres formats boolean GUCs as `on`/`off` — both in
+        // `SHOW <var>` results and in the `ParameterStatus` wire message
+        // sent at startup. PgJDBC's `setupServerParameters` rejects any
+        // other rendering (it raises "could not parse server response: …
+        // expected on or off, got <value>"), and DBeaver / pgcli /
+        // psqlODBC behave the same way. The integer/string/uuid bools
+        // elsewhere in the catalog (e.g. `pg_attribute.attnotnull`) keep
+        // their `t`/`f` rendering — those are typed BOOLEAN columns,
+        // not GUCs, and go through the pgrepr Scalar layer instead of
+        // this `Value` trait.
+        if *self { "on" } else { "off" }.to_string()
     }
 }
 

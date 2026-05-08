@@ -110,11 +110,12 @@ show client_min_messages;
 ----
 WARNING
 
-# standard_conforming_strings
-
-# TODO: Double check how we format bools for session vars. Interestingly,
-# postgres returns 'on' for this.
+# standard_conforming_strings — Postgres formats boolean GUCs as
+# `on`/`off`, both in `SHOW` results and in the startup ParameterStatus
+# message. PgJDBC / DBeaver / pgcli reject anything else
+# ("could not parse server response: expected on or off, got <value>"),
+# so the bool `Value::format` returns the Postgres-canonical rendering.
 query T
 show standard_conforming_strings;
 ----
-true
+on
