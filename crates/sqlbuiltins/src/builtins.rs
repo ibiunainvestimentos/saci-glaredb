@@ -1439,6 +1439,30 @@ SELECT
 FROM (VALUES (1)) WHERE false",
 });
 
+pub static PG_RANGE: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
+    schema: POSTGRES_SCHEMA,
+    name: "pg_range",
+    // Empty stub. asyncpg's `_TYPEINFO` LEFT JOINs `pg_range` on every
+    // `Connection.fetch()` against an unfamiliar OID; without this view
+    // the JOIN aborts with `relation "pg_range" does not exist`,
+    // cascading into "could not introspect type" errors on any
+    // composite/domain column. We have no real range types, so an
+    // empty 7-col rowset is the spec-correct shape.
+    //
+    // `rngmultitypid` is the PG 14+ multirange-type pointer; the 7-col
+    // shape here matches PG 14/15/16 catalog/pg_range.h.
+    sql: "
+SELECT
+    CAST(NULL AS INT)  AS rngtypid,
+    CAST(NULL AS INT)  AS rngsubtype,
+    CAST(NULL AS INT)  AS rngmultitypid,
+    CAST(NULL AS INT)  AS rngcollation,
+    CAST(NULL AS INT)  AS rngsubopc,
+    CAST(NULL AS TEXT) AS rngcanonical,
+    CAST(NULL AS TEXT) AS rngsubdiff
+FROM (VALUES (1)) WHERE false",
+});
+
 pub static PG_SUBSCRIPTION: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     schema: POSTGRES_SCHEMA,
     name: "pg_subscription",
@@ -1490,6 +1514,7 @@ impl BuiltinView {
             &PG_NAMESPACE,
             &PG_PROC,
             &PG_PUBLICATION,
+            &PG_RANGE,
             &PG_REPLICATION_SLOTS,
             &PG_REWRITE,
             &PG_ROLES,

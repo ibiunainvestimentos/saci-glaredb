@@ -1,0 +1,30 @@
+# `pg_catalog.pg_range` — empty-stub view.
+#
+# asyncpg's `_TYPEINFO` LEFT JOINs `pg_range` on every
+# `Connection.fetch()` against an unfamiliar OID. Before this view
+# existed, the JOIN aborted with `relation "pg_range" does not exist`,
+# cascading into "could not introspect type" errors on any
+# composite/domain column. We have no real range types, so an empty
+# rowset with the PG 16 7-col shape is the spec-correct fix.
+
+# Queryable, returns zero rows.
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_range;
+----
+0
+
+# Schema sanity — every PG 16 column is present and selectable, even
+# though the underlying rowset is empty. asyncpg references all 7.
+statement ok
+SELECT rngtypid, rngsubtype, rngmultitypid, rngcollation,
+       rngsubopc, rngcanonical, rngsubdiff
+FROM pg_catalog.pg_range;
+
+# Mimic asyncpg's introspection LEFT JOIN shape (the failure mode
+# this view fixes). Joining `pg_type` ↔ `pg_range` on `typtype='r'`
+# must plan and execute, not error.
+statement ok
+SELECT t.oid, range_t.rngsubtype, range_t.rngmultitypid
+FROM pg_catalog.pg_type t
+LEFT JOIN pg_catalog.pg_range range_t ON range_t.rngtypid = t.oid
+WHERE t.typtype = 'r';
