@@ -190,7 +190,15 @@ message ViewEntry {
   // Output column aliases. If length of zero, no aliases have been defined.
   repeated string columns = 3;
 
-  // next: 4
+  // Resolved column types captured at `CREATE VIEW` time from the planned
+  // SELECT body. Mirrors what `TableEntry.columns` does for internal /
+  // external tables and lets `pg_catalog.pg_attribute` surface real rows
+  // for views (matching real Postgres semantics). Empty for views created
+  // before this field landed; treated as "schema unavailable" by the
+  // dispatcher.
+  repeated options.InternalColumnDefinition column_types = 4;
+
+  // next: 5
 }
 
 message TunnelEntry {

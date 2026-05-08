@@ -488,6 +488,40 @@ impl<'a> SystemTableDispatcher<'a> {
             }
         }
 
+        // Views with column_types captured at CREATE VIEW time. Mirrors
+        // the table loop above; views created before the column_types
+        // field landed have an empty vec and are skipped (matches the
+        // pre-feature behaviour where views simply weren't represented
+        // in glare_catalog.columns at all).
+        for view in self
+            .catalog
+            .iter_entries()
+            .filter(|ent| ent.entry_type() == EntryType::View)
+        {
+            let ent = match view.entry {
+                CatalogEntry::View(ent) => ent,
+                other => panic!("unexpected entry type: {:?}", other), // Bug
+            };
+
+            if ent.column_types.is_empty() {
+                continue;
+            }
+
+            for (i, col) in ent.column_types.iter().enumerate() {
+                schema_oid.append_value(
+                    view.parent_entry
+                        .map(|ent| ent.get_meta().id)
+                        .unwrap_or_default(),
+                );
+                table_oid.append_value(view.oid);
+                table_name.append_value(&view.entry.get_meta().name);
+                column_name.append_value(&col.name);
+                column_ordinal.append_value(i as u32);
+                data_type.append_value(col.arrow_type.to_string());
+                is_nullable.append_value(col.nullable);
+            }
+        }
+
         let batch = RecordBatch::try_new(
             arrow_schema.clone(),
             vec![

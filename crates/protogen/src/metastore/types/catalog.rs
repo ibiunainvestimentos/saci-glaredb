@@ -554,27 +554,46 @@ impl fmt::Display for TableEntry {
 pub struct ViewEntry {
     pub meta: EntryMeta,
     pub sql: String,
+    /// Output column aliases declared at `CREATE VIEW` time, if any.
     pub columns: Vec<String>,
+    /// Resolved column types captured from the planned SELECT body.
+    /// Empty for views created before this field landed; the dispatcher
+    /// treats that case as "schema unavailable" and skips emitting
+    /// `glare_catalog.columns` rows for the view (matches the
+    /// pre-`column_types` behaviour).
+    pub column_types: Vec<InternalColumnDefinition>,
 }
 
 impl TryFrom<catalog::ViewEntry> for ViewEntry {
     type Error = ProtoConvError;
     fn try_from(value: catalog::ViewEntry) -> Result<Self, Self::Error> {
         let meta: EntryMeta = value.meta.required("meta")?;
+        let column_types: Vec<InternalColumnDefinition> = value
+            .column_types
+            .into_iter()
+            .map(|c| c.try_into())
+            .collect::<Result<_, _>>()?;
         Ok(ViewEntry {
             meta,
             sql: value.sql,
             columns: value.columns,
+            column_types,
         })
     }
 }
 
 impl From<ViewEntry> for catalog::ViewEntry {
     fn from(value: ViewEntry) -> Self {
+        let column_types: Vec<gen::metastore::options::InternalColumnDefinition> = value
+            .column_types
+            .into_iter()
+            .map(Into::into)
+            .collect();
         catalog::ViewEntry {
             meta: Some(value.meta.into()),
             sql: value.sql,
             columns: value.columns,
+            column_types,
         }
     }
 }

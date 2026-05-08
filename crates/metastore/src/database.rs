@@ -838,6 +838,7 @@ impl State {
                     },
                     sql: create_view.sql,
                     columns: create_view.columns,
+                    column_types: create_view.column_types,
                 };
 
                 let policy = if create_view.or_replace {
@@ -1335,6 +1336,7 @@ impl BuiltinCatalog {
                     },
                     sql: view.sql.to_string(),
                     columns: Vec::new(),
+                    column_types: Vec::new(),
                 }),
             )?;
             schema_objects
@@ -1590,6 +1592,7 @@ mod tests {
                     sql: format!("select {i}"),
                     or_replace: false,
                     columns: Vec::new(),
+                    column_types: Vec::new(),
                 })
             })
             .collect();
@@ -1686,6 +1689,7 @@ mod tests {
                     sql: "select 1".to_string(),
                     or_replace: false,
                     columns: Vec::new(),
+                    column_types: Vec::new(),
                 })],
             )
             .await
@@ -1728,6 +1732,7 @@ mod tests {
                 sql: "select 1".to_string(),
                 or_replace: false,
                 columns: Vec::new(),
+                column_types: Vec::new(),
             })],
         )
         .await
@@ -1742,6 +1747,7 @@ mod tests {
                 sql: "select 2".to_string(),
                 or_replace: false,
                 columns: Vec::new(),
+                column_types: Vec::new(),
             })],
         )
         .await
@@ -1761,6 +1767,7 @@ mod tests {
                 sql: "select 1".to_string(),
                 or_replace: false,
                 columns: Vec::new(),
+                column_types: Vec::new(),
             })],
         )
         .await
@@ -1775,6 +1782,7 @@ mod tests {
                 sql: "select 2".to_string(),
                 or_replace: false,
                 columns: Vec::new(),
+                column_types: Vec::new(),
             })],
         )
         .await
@@ -1789,6 +1797,7 @@ mod tests {
                 sql: "select 3".to_string(),
                 or_replace: true,
                 columns: Vec::new(),
+                column_types: Vec::new(),
             })],
         )
         .await
@@ -1819,6 +1828,7 @@ mod tests {
                     sql: "select 1".to_string(),
                     or_replace: false,
                     columns: Vec::new(),
+                    column_types: Vec::new(),
                 })],
             )
             .await
@@ -1834,6 +1844,7 @@ mod tests {
                     sql: "select 1".to_string(),
                     or_replace: false,
                     columns: Vec::new(),
+                    column_types: Vec::new(),
                 })],
             )
             .await
@@ -1849,6 +1860,7 @@ mod tests {
                     sql: "select 1".to_string(),
                     or_replace: false,
                     columns: Vec::new(),
+                    column_types: Vec::new(),
                 })],
             )
             .await

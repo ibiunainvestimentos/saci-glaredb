@@ -6,6 +6,7 @@ use prost::{Message, Oneof};
 use super::common::{FullObjectReference, FullSchemaReference};
 use super::copy_to::{CopyToDestinationOptions, CopyToFormatOptions};
 use crate::gen::metastore::catalog::TableEntry;
+use crate::gen::metastore::options::InternalColumnDefinition;
 
 #[derive(Clone, PartialEq, Message)]
 pub struct ClientExchangeRecvExec {
@@ -231,6 +232,8 @@ pub struct CreateViewExec {
     pub columns: Vec<String>,
     #[prost(bool, tag = "5")]
     pub or_replace: bool,
+    #[prost(message, repeated, tag = "6")]
+    pub column_types: Vec<InternalColumnDefinition>,
 }
 
 #[derive(Clone, PartialEq, Message)]

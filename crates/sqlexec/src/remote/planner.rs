@@ -214,6 +214,7 @@ impl ExtensionPlanner for DDLExtensionPlanner {
                     sql: lp.sql.clone(),
                     columns: lp.columns.clone(),
                     or_replace: lp.or_replace,
+                    column_types: lp.column_types.clone(),
                 };
                 RuntimeGroupExec::new(RuntimePreference::Remote, Arc::new(exec))
             }

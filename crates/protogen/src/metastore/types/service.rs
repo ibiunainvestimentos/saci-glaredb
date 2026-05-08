@@ -241,30 +241,46 @@ pub struct CreateView {
     pub sql: String,
     pub or_replace: bool,
     pub columns: Vec<String>,
+    /// Resolved column types from the planned SELECT body. Persisted on
+    /// `ViewEntry.column_types` so `glare_catalog.columns` (and therefore
+    /// `pg_catalog.pg_attribute`) can surface real rows for views.
+    pub column_types: Vec<InternalColumnDefinition>,
 }
 
 impl TryFrom<service::CreateView> for CreateView {
     type Error = ProtoConvError;
     fn try_from(value: service::CreateView) -> Result<Self, Self::Error> {
         // TODO: Check if string are zero value.
+        let column_types: Vec<InternalColumnDefinition> = value
+            .column_types
+            .into_iter()
+            .map(|c| c.try_into())
+            .collect::<Result<_, _>>()?;
         Ok(CreateView {
             schema: value.schema,
             name: value.name,
             sql: value.sql,
             or_replace: value.or_replace,
             columns: value.columns,
+            column_types,
         })
     }
 }
 
 impl From<CreateView> for service::CreateView {
     fn from(value: CreateView) -> Self {
+        let column_types: Vec<gen::metastore::options::InternalColumnDefinition> = value
+            .column_types
+            .into_iter()
+            .map(Into::into)
+            .collect();
         service::CreateView {
             schema: value.schema,
             name: value.name,
             sql: value.sql,
             or_replace: value.or_replace,
             columns: value.columns,
+            column_types,
         }
     }
 }

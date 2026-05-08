@@ -1,3 +1,5 @@
+use protogen::metastore::types::options::InternalColumnDefinition;
+
 use super::{
     DfLogicalPlan,
     ExtensionNode,
@@ -11,6 +13,11 @@ pub struct CreateView {
     pub sql: String,
     pub columns: Vec<String>,
     pub or_replace: bool,
+    /// Column types resolved from the planned SELECT body (one per
+    /// output field, ordered). Captured at plan time so the metastore
+    /// can record real column rows for the view in
+    /// `glare_catalog.columns` (and therefore `pg_catalog.pg_attribute`).
+    pub column_types: Vec<InternalColumnDefinition>,
 }
 
 impl UserDefinedLogicalNodeCore for CreateView {

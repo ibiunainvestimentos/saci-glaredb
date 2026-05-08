@@ -514,6 +514,7 @@ mod tests {
                     sql: "select 1".to_string(),
                     or_replace: false,
                     columns: Vec::new(),
+                    column_types: Vec::new(),
                 })],
             )
             .await

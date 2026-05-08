@@ -633,6 +633,11 @@ pub static PG_ATTRIBUTE: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     // `atttypid` is resolved via the helper UDF `pg_type_oid_by_name`
     // against the Arrow type name stored in `glare_catalog.columns.data_type`
     // — see `pgrepr::pg_type_oid::arrow_name_to_pg_oid` for the bijection.
+    //
+    // `glare_catalog.columns` carries rows for both tables and views (the
+    // dispatcher emits view rows from `ViewEntry.column_types`, captured
+    // at `CREATE VIEW` time from the planned SELECT body), so a single
+    // projection covers both `relkind='r'` and `relkind='v'` consumers.
     sql: "
 SELECT
     c.table_oid                            AS attrelid,

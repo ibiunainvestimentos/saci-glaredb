@@ -1,0 +1,107 @@
+# Views must surface their resolved column schema in
+# `pg_catalog.pg_attribute` — same as real Postgres records pg_attribute
+# rows for views at `CREATE VIEW` time from the SELECT's resolved
+# schema. The dispatcher emits view rows from `ViewEntry.column_types`,
+# which is captured at plan time in `session_planner` from the planned
+# SELECT's `DFSchema`.
+
+statement ok
+create schema views_pg_attribute_test;
+
+statement ok
+set search_path = views_pg_attribute_test;
+
+# ----------------------------------------------------------------------
+# Case 1 — `SELECT *` over an internal table. Mirrors the saci 3-tier
+# `<X>.T` view alias over `storage_<X>.T` registration pattern.
+# ----------------------------------------------------------------------
+statement ok
+create temp table source_t (a int, b text);
+
+statement ok
+create view view_star as select * from source_t;
+
+query TT rowsort
+select a.attname, pg_type.typname
+from pg_catalog.pg_attribute a
+join pg_catalog.pg_class c on c.oid = a.attrelid
+join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+join pg_catalog.pg_type on pg_type.oid = a.atttypid
+where n.nspname = 'views_pg_attribute_test'
+  and c.relname = 'view_star'
+  and a.attnum > 0
+order by a.attnum;
+----
+a  int4
+b  text
+
+# ----------------------------------------------------------------------
+# Case 2 — Computed projection. The previous saci-specific UNION ALL
+# in PG_ATTRIBUTE couldn't handle this shape (it only mirrored 1:1
+# storage_*.T → <X>.T columns); the schema-capture-at-plan-time fix
+# does, because DataFusion resolves the result type during
+# `query_to_plan`.
+# ----------------------------------------------------------------------
+statement ok
+create view view_computed as
+    select a as id, a + 1 as next_id, cast(a as bigint) as wide_id
+    from source_t;
+
+query TT rowsort
+select a.attname, pg_type.typname
+from pg_catalog.pg_attribute a
+join pg_catalog.pg_class c on c.oid = a.attrelid
+join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+join pg_catalog.pg_type on pg_type.oid = a.atttypid
+where n.nspname = 'views_pg_attribute_test'
+  and c.relname = 'view_computed'
+  and a.attnum > 0
+order by a.attnum;
+----
+id       int4
+next_id  int4
+wide_id  int8
+
+# ----------------------------------------------------------------------
+# Case 3 — `CREATE OR REPLACE VIEW` with a shape change.
+# pg_attribute reflects the new schema after replace.
+# ----------------------------------------------------------------------
+statement ok
+create or replace view view_computed as
+    select b as label, length(b) as len from source_t;
+
+query TT rowsort
+select a.attname, pg_type.typname
+from pg_catalog.pg_attribute a
+join pg_catalog.pg_class c on c.oid = a.attrelid
+join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+join pg_catalog.pg_type on pg_type.oid = a.atttypid
+where n.nspname = 'views_pg_attribute_test'
+  and c.relname = 'view_computed'
+  and a.attnum > 0
+order by a.attnum;
+----
+label  text
+len    int4
+
+# ----------------------------------------------------------------------
+# Case 4 — Aliases in `CREATE VIEW (a, b, c) AS …` form override the
+# source field names but keep the resolved types from the SELECT.
+# ----------------------------------------------------------------------
+statement ok
+create view view_aliased (renamed_id, renamed_label) as
+    select a, b from source_t;
+
+query TT rowsort
+select a.attname, pg_type.typname
+from pg_catalog.pg_attribute a
+join pg_catalog.pg_class c on c.oid = a.attrelid
+join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+join pg_catalog.pg_type on pg_type.oid = a.atttypid
+where n.nspname = 'views_pg_attribute_test'
+  and c.relname = 'view_aliased'
+  and a.attnum > 0
+order by a.attnum;
+----
+renamed_id     int4
+renamed_label  text

@@ -72,6 +72,11 @@ message CreateView {
   string sql = 3;
   bool or_replace = 4;
   repeated string columns = 5;
+
+  // Resolved column types from the planned SELECT body. Persisted on
+  // `ViewEntry.column_types` so `glare_catalog.columns` (and therefore
+  // `pg_catalog.pg_attribute`) can surface real rows for views.
+  repeated options.InternalColumnDefinition column_types = 6;
 }
 
 message CreateTable {

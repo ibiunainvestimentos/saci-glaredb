@@ -18,6 +18,7 @@ use datafusion::physical_plan::{
     Statistics,
 };
 use futures::stream;
+use protogen::metastore::types::options::InternalColumnDefinition;
 use protogen::metastore::types::service::{self, Mutation};
 
 use super::{new_operation_batch, GENERIC_OPERATION_PHYSICAL_SCHEMA};
@@ -30,6 +31,11 @@ pub struct CreateViewExec {
     pub sql: String,
     pub columns: Vec<String>,
     pub or_replace: bool,
+    /// Resolved column types from the planned SELECT body. Persisted on
+    /// the view's `glare_catalog.columns` rows so consumers (PgJDBC,
+    /// asyncpg, ibis schema discovery) can resolve view schemas via
+    /// `pg_catalog.pg_attribute` the way they do for tables.
+    pub column_types: Vec<InternalColumnDefinition>,
 }
 
 impl ExecutionPlan for CreateViewExec {
@@ -114,6 +120,7 @@ async fn create_view(
                 sql: plan.sql,
                 or_replace: plan.or_replace,
                 columns: plan.columns,
+                column_types: plan.column_types,
             })],
         )
         .await

@@ -324,16 +324,29 @@ impl<'a> PhysicalExtensionCodec for GlareDBExtensionCodec<'a> {
                     options: options.try_into()?,
                 })
             }
-            proto::ExecutionPlanExtensionType::CreateViewExec(ext) => Arc::new(CreateViewExec {
-                catalog_version: ext.catalog_version,
-                view_reference: ext
-                    .view_reference
-                    .ok_or_else(|| DataFusionError::Internal("missing view reference".to_string()))?
-                    .into(),
-                sql: ext.sql,
-                columns: ext.columns,
-                or_replace: ext.or_replace,
-            }),
+            proto::ExecutionPlanExtensionType::CreateViewExec(ext) => {
+                let column_types = ext
+                    .column_types
+                    .into_iter()
+                    .map(|c| c.try_into())
+                    .collect::<Result<_, _>>()
+                    .map_err(|e: protogen::ProtoConvError| {
+                        DataFusionError::Internal(format!("invalid view column types: {e}"))
+                    })?;
+                Arc::new(CreateViewExec {
+                    catalog_version: ext.catalog_version,
+                    view_reference: ext
+                        .view_reference
+                        .ok_or_else(|| {
+                            DataFusionError::Internal("missing view reference".to_string())
+                        })?
+                        .into(),
+                    sql: ext.sql,
+                    columns: ext.columns,
+                    or_replace: ext.or_replace,
+                    column_types,
+                })
+            }
             proto::ExecutionPlanExtensionType::DropCredentialsExec(ext) => {
                 Arc::new(DropCredentialsExec {
                     catalog_version: ext.catalog_version,
@@ -658,6 +671,12 @@ impl<'a> PhysicalExtensionCodec for GlareDBExtensionCodec<'a> {
                 sql: exec.sql.clone(),
                 columns: exec.columns.clone(),
                 or_replace: exec.or_replace,
+                column_types: exec
+                    .column_types
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect(),
             })
         } else if let Some(exec) = node.as_any().downcast_ref::<DescribeTableExec>() {
             proto::ExecutionPlanExtensionType::DescribeTable(proto::DescribeTableExec {

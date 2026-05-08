@@ -128,6 +128,7 @@ use protogen::metastore::types::options::{
     TableOptionsS3,
     TableOptionsSnowflake,
     TableOptionsSqlServer,
+    InternalColumnDefinition,
     TableOptionsV0,
     TunnelOptions,
     TunnelOptionsDebug,
@@ -1438,11 +1439,35 @@ impl<'a> SessionPlanner<'a> {
                         aliases: columns,
                     })
                 } else {
+                    // Capture the resolved column schema (name + type +
+                    // nullability) from the planned SELECT body so the
+                    // metastore can later emit `glare_catalog.columns`
+                    // rows for this view, the same way internal /
+                    // external tables do. If column aliases were
+                    // declared in the `CREATE VIEW (a, b, c) AS …`
+                    // form, prefer those names over the source field
+                    // names; the type and nullability still come from
+                    // the planned schema.
+                    let column_types: Vec<InternalColumnDefinition> = input
+                        .schema()
+                        .fields()
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, field)| InternalColumnDefinition {
+                            name: columns
+                                .get(idx)
+                                .cloned()
+                                .unwrap_or_else(|| field.name().clone()),
+                            nullable: field.is_nullable(),
+                            arrow_type: field.data_type().clone(),
+                        })
+                        .collect();
                     Ok(CreateView {
                         view_reference: self.ctx.resolve_table_ref(name)?,
                         sql: query_string,
                         columns,
                         or_replace,
+                        column_types,
                     }
                     .into_logical_plan())
                 }
