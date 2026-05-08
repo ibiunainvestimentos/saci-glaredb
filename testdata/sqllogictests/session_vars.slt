@@ -77,3 +77,53 @@ iso_8601
 
 statement ok
 SET IntervalStyle TO 'postgres';
+
+# `GUC_REPORT` GUCs added in PG 14/16 — drivers (PgJDBC 42.5+,
+# psycopg2 2.8+) branch on these at connect time. Real Postgres
+# emits all three in the startup `ParameterStatus` chatter and
+# accepts them via `SHOW`.
+
+query T
+SHOW in_hot_standby;
+----
+off
+
+query T
+SHOW default_transaction_read_only;
+----
+off
+
+query T
+SHOW scram_iterations;
+----
+4096
+
+# `default_transaction_read_only` is user-configurable (matches PG's
+# GUC context — `USERSET`), the other two are read-only.
+statement ok
+SET default_transaction_read_only TO on;
+
+query T
+SHOW default_transaction_read_only;
+----
+on
+
+statement ok
+SET default_transaction_read_only TO off;
+
+# `scram_iterations` is `PGC_USERSET` in PG 16 — clients can lower it
+# per session for slow handshakes. Round-trip the SET.
+statement ok
+SET scram_iterations TO 8192;
+
+query T
+SHOW scram_iterations;
+----
+8192
+
+statement ok
+SET scram_iterations TO 4096;
+
+# `in_hot_standby` is `PGC_INTERNAL` — read-only, set must error.
+statement error
+SET in_hot_standby TO on;

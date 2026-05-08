@@ -35,12 +35,12 @@ ISO
 query T
 show transaction_isolation;
 ----
-read uncommitted
+read committed
 
 query T
 show transaction isolation level;
 ----
-read uncommitted
+read committed
 
 # Version not static, can only check that it doesn't error.
 statement ok

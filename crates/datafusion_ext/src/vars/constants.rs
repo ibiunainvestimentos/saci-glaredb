@@ -1,4 +1,5 @@
-use pgrepr::compatible::server_version;
+use const_format::formatcp;
+use pgrepr::compatible::{server_version, PG_MAJOR_VERSION, PG_MINOR_VERSION};
 use pgrepr::notice::NoticeSeverity;
 
 use super::{Dialect, Lazy, ServerVar, ToOwned, Uuid};
@@ -15,15 +16,25 @@ pub(super) const SERVER_VERSION: ServerVar<str> = ServerVar {
 /// (`server_version_num >= 90100`, `>= 140000`, etc.) to enable
 /// version-specific code paths (partitioning, generated columns, etc.).
 /// Reported alongside `server_version` in the startup ParameterStatus.
+///
+/// Single-sourced from `pgrepr::compatible::{PG_MAJOR_VERSION,
+/// PG_MINOR_VERSION}` so bumping the spoofed PG version in one place
+/// updates both `server_version` and `server_version_num` together.
+/// Format: `MAJOR * 10000 + MINOR` (PG 10+ convention) — 15.1 → 150001.
+///
+/// `as u32` is required: the constants are `u16`, but
+/// `15u16 * 10000` overflows u16. `u32::from(...)` would be cleaner
+/// stylistically but `From::from` is not `const fn`, and this expression
+/// has to be const-evaluable for `formatcp!`.
+const SERVER_VERSION_NUM_VALUE: &str =
+    formatcp!("{}", PG_MAJOR_VERSION as u32 * 10000 + PG_MINOR_VERSION as u32);
+
 pub(super) const SERVER_VERSION_NUM: ServerVar<str> = ServerVar {
     name: "server_version_num",
-    // Mirror `pgrepr::compatible::server_version()` (currently 15.1).
-    // Encoded as MMmm00 — 15.1 → 150001 — matching upstream PostgreSQL's
-    // `server_version_num` GUC format.
-    value: "150001",
+    value: SERVER_VERSION_NUM_VALUE,
     group: "postgres",
     user_configurable: false,
-    description: "Numeric form of server_version (MMmm00).",
+    description: "Numeric form of server_version (MAJOR*10000+MINOR).",
 };
 
 pub(super) const SERVER_ENCODING: ServerVar<str> = ServerVar {
@@ -119,10 +130,46 @@ pub(super) const DATESTYLE: ServerVar<str> = ServerVar {
 
 pub(super) const TRANSACTION_ISOLATION: ServerVar<str> = ServerVar {
     name: "transaction_isolation",
-    value: "read uncommitted",
+    // PG 16 boot_val. PgJDBC reads this verbatim into
+    // `Connection.getTransactionIsolation()`; reporting
+    // 'read uncommitted' silently put every JDBC connection at
+    // TRANSACTION_READ_UNCOMMITTED, which differs from real Postgres
+    // out-of-the-box behaviour.
+    value: "read committed",
     group: "postgres",
     user_configurable: false,
-    description: "Transaction isolation level, defaults to 'read uncommitted'",
+    description: "Transaction isolation level, defaults to 'read committed'",
+};
+
+/// `GUC_REPORT` GUCs added in PG 14/16 that drivers branch on at
+/// connect time. Real Postgres emits these in the startup
+/// `ParameterStatus` chatter; without them PgJDBC 42.5+ falls back
+/// to safe-but-wrong defaults (read-only routing decisions, SCRAM
+/// iteration budgets), and psycopg2 2.8+ logs warnings.
+pub(super) const IN_HOT_STANDBY: ServerVar<bool> = ServerVar {
+    name: "in_hot_standby",
+    value: &false,
+    group: "postgres",
+    user_configurable: false,
+    description: "Whether the server is in hot-standby mode (always off — GlareDB has no replication).",
+};
+
+pub(super) const DEFAULT_TRANSACTION_READ_ONLY: ServerVar<bool> = ServerVar {
+    name: "default_transaction_read_only",
+    value: &false,
+    group: "postgres",
+    user_configurable: true,
+    description: "Default transaction read-only flag.",
+};
+
+pub(super) const SCRAM_ITERATIONS: ServerVar<i32> = ServerVar {
+    name: "scram_iterations",
+    value: &4096,
+    group: "postgres",
+    // `PGC_USERSET` in PG 16 — clients can lower the iteration count
+    // per session (e.g. for slow clients). User-settable to match.
+    user_configurable: true,
+    description: "SCRAM authentication iteration count (PG 16+ default).",
 };
 
 pub(super) static DEFAULT_SEARCH_PATH: Lazy<[String; 1]> = Lazy::new(|| ["public".to_owned()]);

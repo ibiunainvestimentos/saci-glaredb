@@ -19,12 +19,14 @@ use super::constants::{
     DATABASE_ID,
     DATABASE_NAME,
     DATESTYLE,
+    DEFAULT_TRANSACTION_READ_ONLY,
     DIALECT,
     ENABLE_DEBUG_DATASOURCES,
     ENABLE_EXPERIMENTAL_SCHEDULER,
     EXTRA_FLOAT_DIGITS,
     FORCE_CATALOG_REFRESH,
     GLAREDB_VERSION,
+    IN_HOT_STANDBY,
     INTEGER_DATETIMES,
     INTERVAL_STYLE,
     IS_CLOUD_INSTANCE,
@@ -34,6 +36,7 @@ use super::constants::{
     MAX_TUNNEL_COUNT,
     MEMORY_LIMIT_BYTES,
     REMOTE_SESSION_ID,
+    SCRAM_ITERATIONS,
     SEARCH_PATH,
     SERVER_ENCODING,
     SERVER_VERSION,
@@ -98,17 +101,32 @@ pub struct SessionVarsInner {
     pub is_cloud_instance: SessionVar<bool>,
     pub dialect: SessionVar<Dialect>,
     pub enable_experimental_scheduler: SessionVar<bool>,
+    /// `in_hot_standby` (PG 14+) — `GUC_REPORT`. PgJDBC 42.5+ branches
+    /// on this for read-only routing.
+    pub in_hot_standby: SessionVar<bool>,
+    /// `default_transaction_read_only` — `GUC_REPORT`. PgJDBC reads at
+    /// connect time for `Connection.isReadOnly()` fallback.
+    pub default_transaction_read_only: SessionVar<bool>,
+    /// `scram_iterations` (PG 16+) — `GUC_REPORT`. PgJDBC SCRAM auth
+    /// budget; surfaces in `ParameterStatus` chatter.
+    pub scram_iterations: SessionVar<i32>,
 }
 
 impl SessionVarsInner {
     /// Return an iterator to the variables that should be sent to the client
-    /// on session start as `ParameterStatus` messages. Real Postgres emits
-    /// roughly a dozen of these so JDBC / DBeaver / drivers can branch on
-    /// version, encoding, datestyle etc. without an extra round-trip.
+    /// on session start as `ParameterStatus` messages. The set matches
+    /// upstream Postgres's `GUC_REPORT`-flagged GUCs (see
+    /// `src/backend/utils/misc/guc_tables.c`): `server_version`,
+    /// `server_encoding`, `client_encoding`, `application_name`,
+    /// `is_superuser`, `session_authorization`, `DateStyle`,
+    /// `IntervalStyle`, `TimeZone`, `integer_datetimes`,
+    /// `standard_conforming_strings`, plus the three added in PG 14/16
+    /// (`in_hot_standby`, `default_transaction_read_only`,
+    /// `scram_iterations`). `server_version_num` is NOT GUC_REPORT in
+    /// upstream and is read lazily via `SHOW`.
     pub fn startup_vars_iter(&self) -> impl Iterator<Item = &dyn AnyVar> {
-        let vars: [&dyn AnyVar; 12] = [
+        let vars: [&dyn AnyVar; 14] = [
             &self.server_version,
-            &self.server_version_num,
             &self.server_encoding,
             &self.client_encoding,
             &self.application_name,
@@ -119,6 +137,12 @@ impl SessionVarsInner {
             &self.timezone,
             &self.integer_datetimes,
             &self.standard_conforming_strings,
+            // Three additional `GUC_REPORT` vars from PG 14/16. Drivers
+            // (PgJDBC 42.5+, psycopg2 2.8+) branch on these at connect
+            // time; absence forces them onto safe-but-wrong fallbacks.
+            &self.in_hot_standby,
+            &self.default_transaction_read_only,
+            &self.scram_iterations,
         ];
         vars.into_iter()
     }
@@ -191,6 +215,12 @@ impl SessionVarsInner {
             Ok(&self.dialect)
         } else if name.eq_ignore_ascii_case(ENABLE_EXPERIMENTAL_SCHEDULER.name) {
             Ok(&self.enable_experimental_scheduler)
+        } else if name.eq_ignore_ascii_case(IN_HOT_STANDBY.name) {
+            Ok(&self.in_hot_standby)
+        } else if name.eq_ignore_ascii_case(DEFAULT_TRANSACTION_READ_ONLY.name) {
+            Ok(&self.default_transaction_read_only)
+        } else if name.eq_ignore_ascii_case(SCRAM_ITERATIONS.name) {
+            Ok(&self.scram_iterations)
         } else {
             Err(VarError::UnknownVariable(name.to_string()).into())
         }
@@ -262,6 +292,12 @@ impl SessionVarsInner {
             self.dialect.set_from_str(val, setter)
         } else if name.eq_ignore_ascii_case(ENABLE_EXPERIMENTAL_SCHEDULER.name) {
             self.enable_experimental_scheduler.set_from_str(val, setter)
+        } else if name.eq_ignore_ascii_case(IN_HOT_STANDBY.name) {
+            self.in_hot_standby.set_from_str(val, setter)
+        } else if name.eq_ignore_ascii_case(DEFAULT_TRANSACTION_READ_ONLY.name) {
+            self.default_transaction_read_only.set_from_str(val, setter)
+        } else if name.eq_ignore_ascii_case(SCRAM_ITERATIONS.name) {
+            self.scram_iterations.set_from_str(val, setter)
         } else {
             Err(VarError::UnknownVariable(name.to_string()).into())
         }
@@ -303,6 +339,16 @@ impl SessionVarsInner {
             self.max_credentials_count.config_entry(),
             self.is_cloud_instance.config_entry(),
             self.dialect.config_entry(),
+            self.in_hot_standby.config_entry(),
+            self.default_transaction_read_only.config_entry(),
+            self.scram_iterations.config_entry(),
+            // Pre-existing GUCs that were defined on the struct but
+            // missing from `entries()` — surfaced here so they show
+            // up in `glare_catalog.session_vars` → `pg_settings`,
+            // matching what every other settable GUC does.
+            self.client_min_messages.config_entry(),
+            self.standard_conforming_strings.config_entry(),
+            self.enable_experimental_scheduler.config_entry(),
         ]
     }
 }
@@ -342,6 +388,9 @@ impl Default for SessionVarsInner {
             is_cloud_instance: SessionVar::new(&IS_CLOUD_INSTANCE),
             dialect: SessionVar::new(&DIALECT),
             enable_experimental_scheduler: SessionVar::new(&ENABLE_EXPERIMENTAL_SCHEDULER),
+            in_hot_standby: SessionVar::new(&IN_HOT_STANDBY),
+            default_transaction_read_only: SessionVar::new(&DEFAULT_TRANSACTION_READ_ONLY),
+            scram_iterations: SessionVar::new(&SCRAM_ITERATIONS),
         }
     }
 }
