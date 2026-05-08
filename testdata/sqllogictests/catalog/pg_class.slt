@@ -1,0 +1,71 @@
+# `pg_catalog.pg_class` — relation enumeration. Adapted from CRDB's
+# pg_catalog corpus, with schema-locked CREATE TABLE setup replaced
+# by plain int/text DDL on a public-schema table (the original CRDB
+# fixture used BIT(5)/COLLATE/generated columns we don't support).
+
+statement ok
+CREATE SCHEMA pg_class_test;
+
+statement ok
+SET search_path TO pg_class_test;
+
+statement ok
+CREATE TABLE t1 (a INT, b TEXT, c FLOAT8);
+
+statement ok
+CREATE VIEW v1 AS SELECT a, b FROM t1;
+
+# Tables enumerated under our schema have relkind='r'.
+query TT rowsort
+SELECT c.relname, n.nspname
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+WHERE n.nspname = 'pg_class_test'
+ORDER BY c.relname;
+----
+t1 pg_class_test
+v1 pg_class_test
+
+# Relkind is `r` for tables, `v` for views — exactly the two values
+# we project.
+query T rowsort
+SELECT DISTINCT relkind FROM pg_catalog.pg_class
+WHERE relnamespace = (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname='pg_class_test');
+----
+r
+v
+
+# `relowner` is hardcoded to 10 (glaredb super-role); never NULL.
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_class WHERE relowner IS NULL;
+----
+0
+
+# `relpersistence` is `'p'` (permanent) for every row — we don't
+# ship temp/unlogged tables in this projection.
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_class WHERE relpersistence != 'p';
+----
+0
+
+# Built-in pg_catalog tables (e.g., pg_class itself) show up.
+query B
+SELECT COUNT(*) > 0
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+WHERE n.nspname = 'pg_catalog' AND c.relname = 'pg_class';
+----
+true
+
+# Cleanup.
+statement ok
+DROP VIEW v1;
+
+statement ok
+DROP TABLE t1;
+
+statement ok
+SET search_path TO public;
+
+statement ok
+DROP SCHEMA pg_class_test;

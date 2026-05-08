@@ -1,0 +1,51 @@
+# `pg_catalog.pg_database` — database enumeration. Adapted from CRDB's
+# pg_catalog corpus, narrowed to the columns we actually emit
+# (oid, datname, datdba, encoding, datcollate, datctype,
+# datistemplate, datallowconn) and rebaselined for our single-DB
+# `glaredb` deployment.
+
+# At least one row exists (the connection-time DB).
+query B
+SELECT COUNT(*) > 0 FROM pg_catalog.pg_database;
+----
+true
+
+# `datallowconn` is true on every row — we don't ship template
+# databases or NOLOGIN-style restrictions.
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_database WHERE datallowconn = false;
+----
+0
+
+# `datistemplate` is false on every row — same reason.
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_database WHERE datistemplate = true;
+----
+0
+
+# Encoding is UTF8 (oid 6) for every row.
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_database WHERE encoding != 6;
+----
+0
+
+# `datcollate` and `datctype` set to `en_US.UTF-8`.
+query TT
+SELECT DISTINCT datcollate, datctype FROM pg_catalog.pg_database;
+----
+en_US.UTF-8 en_US.UTF-8
+
+# Connection-time database is enumerated by `current_database()`
+# (Phase 1 / pg_database.PG_DATABASE synthesis).
+query B
+SELECT current_database() IN (SELECT datname FROM pg_catalog.pg_database);
+----
+true
+
+# Column-shape probe.
+statement ok
+SELECT oid, datname, datdba, encoding, datlocprovider, datistemplate,
+       datallowconn, datconnlimit, datfrozenxid, datminmxid,
+       dattablespace, datcollate, datctype, daticulocal, daticurules,
+       datcollversion, datacl
+FROM pg_catalog.pg_database WHERE 1 <> 1;

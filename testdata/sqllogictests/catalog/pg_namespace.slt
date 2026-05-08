@@ -1,0 +1,38 @@
+# `pg_catalog.pg_namespace` — schema enumeration. Adapted from CRDB's
+# pg_catalog logictest fixture, with the stable-OID columns dropped
+# (CRDB hardcodes `nspowner` to specific hashed integers; we don't
+# need to assert exact values) and the schema list rebaselined for
+# our surface.
+
+# Every required builtin schema is present.
+query T rowsort
+SELECT nspname FROM pg_catalog.pg_namespace
+WHERE nspname IN ('pg_catalog', 'information_schema', 'public');
+----
+information_schema
+pg_catalog
+public
+
+# Spot-check that `nspowner` is non-NULL for every row (we hardcode
+# 10 = the `glaredb` super-role).
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_namespace WHERE nspowner IS NULL;
+----
+0
+
+# `nspacl` is NULL — we have no privilege model.
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_namespace WHERE nspacl IS NOT NULL;
+----
+0
+
+# Schema-shape probe.
+statement ok
+SELECT oid, nspname, nspowner, nspacl
+FROM pg_catalog.pg_namespace WHERE 1 <> 1;
+
+# `oid` is unique across rows.
+query B
+SELECT COUNT(DISTINCT oid) = COUNT(*) FROM pg_catalog.pg_namespace;
+----
+true

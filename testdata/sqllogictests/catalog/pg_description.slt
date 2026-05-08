@@ -1,0 +1,74 @@
+# `pg_catalog.pg_description` — object comments. Sourced from
+# `glare_catalog.tables.comment` and `glare_catalog.views.comment`
+# (per builtins.rs PG_DESCRIPTION body). Verifies COMMENT ON
+# round-trips to the view and that classoid is the canonical
+# pg_class oid (1259).
+
+statement ok
+CREATE SCHEMA pg_desc_test;
+
+statement ok
+SET search_path TO pg_desc_test;
+
+statement ok
+CREATE TABLE commented_t (id INT);
+
+statement ok
+COMMENT ON TABLE commented_t IS 'a table with a comment';
+
+statement ok
+CREATE VIEW commented_v AS SELECT id FROM commented_t;
+
+statement ok
+COMMENT ON VIEW commented_v IS 'a view with a comment';
+
+# pg_description picks up the table comment.
+query T
+SELECT description FROM pg_catalog.pg_description d
+JOIN pg_catalog.pg_class c ON c.oid = d.objoid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'pg_desc_test' AND c.relname = 'commented_t';
+----
+a table with a comment
+
+# Same for the view.
+query T
+SELECT description FROM pg_catalog.pg_description d
+JOIN pg_catalog.pg_class c ON c.oid = d.objoid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'pg_desc_test' AND c.relname = 'commented_v';
+----
+a view with a comment
+
+# `classoid` is 1259 for both tables and views (the canonical
+# pg_class oid in real Postgres).
+query I rowsort
+SELECT DISTINCT classoid FROM pg_catalog.pg_description d
+JOIN pg_catalog.pg_class c ON c.oid = d.objoid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'pg_desc_test';
+----
+1259
+
+# `objsubid` is 0 for relation-level comments (column-level comments
+# would use the column ordinal — pending column-level COMMENT support).
+query I
+SELECT DISTINCT objsubid FROM pg_catalog.pg_description d
+JOIN pg_catalog.pg_class c ON c.oid = d.objoid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'pg_desc_test';
+----
+0
+
+# Cleanup.
+statement ok
+DROP VIEW commented_v;
+
+statement ok
+DROP TABLE commented_t;
+
+statement ok
+SET search_path TO public;
+
+statement ok
+DROP SCHEMA pg_desc_test;
