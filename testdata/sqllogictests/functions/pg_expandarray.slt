@@ -1,0 +1,73 @@
+# `information_schema._pg_expandarray(int2vector)` — PgJDBC's
+# `getPrimaryKeys` / `getBestRowIdentifier` / `getIndexInfo` wrap this
+# around `pg_index.indkey` to pull the per-key ordinal. Real PG ships
+# it in `information_schema.sql`. Until we have a native `int2vector`
+# Arrow type, our `pg_index.indkey` is space-separated text — this
+# function consumes that exact wire form.
+
+# Bare reference (lives in public schema like every other builtin
+# table function).
+query II
+SELECT * FROM _pg_expandarray('23 25 1043');
+----
+23 1
+25 2
+1043 3
+
+# Schema-qualified reference — the form PgJDBC actually emits. Goes
+# through `resolve_entry`'s `information_schema`/`pg_catalog`
+# fall-through to `resolve_builtin_table_function`.
+query II
+SELECT * FROM information_schema._pg_expandarray('1 2 3');
+----
+1 1
+2 2
+3 3
+
+# `pg_catalog` qualifier — symmetric with PG's implicit search path.
+query II
+SELECT * FROM pg_catalog._pg_expandarray('100 200');
+----
+100 1
+200 2
+
+# Empty input → zero rows (matches PG semantics for an empty
+# int2vector). Pure-whitespace input behaves the same.
+query II
+SELECT * FROM information_schema._pg_expandarray('');
+----
+
+query II
+SELECT * FROM information_schema._pg_expandarray('   ');
+----
+
+# Single element.
+query II
+SELECT * FROM information_schema._pg_expandarray('42');
+----
+42 1
+
+# Negative int2 values must parse — defensive coverage.
+query II
+SELECT * FROM information_schema._pg_expandarray('-1 -2');
+----
+-1 1
+-2 2
+
+# Project just the ordinal — PgJDBC reads `n` as `getInt(...)` and
+# uses it as the per-key sequence number in `getPrimaryKeys`.
+query I
+SELECT n FROM information_schema._pg_expandarray('10 20 30') ORDER BY n;
+----
+1
+2
+3
+
+# Non-numeric input → `InvalidParamValue` (preserves the parse-time
+# contract real PG would enforce for a bad int2vector cast).
+statement error Invalid parameter value not-a-number, expected a int2
+SELECT * FROM _pg_expandarray('not-a-number');
+
+# Integer overflow → token outside int2 range.
+statement error Invalid parameter value 99999, expected a int2
+SELECT * FROM _pg_expandarray('99999');

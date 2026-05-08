@@ -13,6 +13,7 @@ mod mongodb;
 mod mysql;
 mod object_store;
 mod parquet_metadata;
+mod pg_expandarray;
 mod postgres;
 mod read_blob;
 mod read_text;
@@ -53,6 +54,7 @@ use self::mongodb::ReadMongoDb;
 use self::mysql::ReadMysql;
 use self::object_store::{CloudUpload, READ_CSV, READ_JSON, READ_PARQUET};
 use self::parquet_metadata::ParquetMetadataFunc;
+use self::pg_expandarray::PgExpandArray;
 use self::postgres::ReadPostgres;
 use self::read_blob::READ_BLOB;
 use self::read_text::READ_TEXT;
@@ -126,6 +128,9 @@ impl BuiltinTableFuncs {
             Arc::new(ListColumns),
             // Series generating
             Arc::new(GenerateSeries),
+            // Postgres compat — `information_schema._pg_expandarray`
+            // backs PgJDBC's primary-key / index-info introspection.
+            Arc::new(PgExpandArray),
             // System operations
             Arc::new(CacheExternalDatabaseTables),
             // Metadata functions

@@ -3,7 +3,12 @@ use std::borrow::Cow;
 use catalog::session_catalog::SessionCatalog;
 use datafusion::sql::TableReference;
 use protogen::metastore::types::catalog::{CatalogEntry, DatabaseEntry, TableEntry};
-use sqlbuiltins::builtins::{CURRENT_SESSION_SCHEMA, DEFAULT_CATALOG};
+use sqlbuiltins::builtins::{
+    CURRENT_SESSION_SCHEMA,
+    DEFAULT_CATALOG,
+    INFORMATION_SCHEMA,
+    POSTGRES_SCHEMA,
+};
 
 use crate::context::local::LocalSessionContext;
 
@@ -102,6 +107,32 @@ impl<'a> EntryResolver<'a> {
                 if let Some(ent) = self.catalog.resolve_entry(DEFAULT_CATALOG, schema, table) {
                     return Ok(ResolvedEntry::Entry(ent.clone()));
                 }
+
+                // Built-in PG-compat table-returning functions (e.g.
+                // `_pg_expandarray`, `pg_get_keywords`) live in the
+                // `public` schema in our metastore but real Postgres
+                // exposes them under `information_schema` /
+                // `pg_catalog`. Drivers (PgJDBC, asyncpg, psycopg)
+                // hard-code those qualifications. Mirror PG's
+                // implicit-pg_catalog-search-path semantics by
+                // accepting the schema prefix when the bare-name
+                // lookup against the builtin TableReturning registry
+                // succeeds.
+                //
+                // Restricted by name allowlist so non-PG functions
+                // (`read_parquet`, `delta_scan`, etc.) cannot be
+                // routed through the PG schemas — that would be a
+                // surface-widening surprise relative to real Postgres.
+                if (schema.as_ref() == INFORMATION_SCHEMA
+                    || schema.as_ref() == POSTGRES_SCHEMA)
+                    && is_pg_compat_table_func(table.as_ref())
+                {
+                    if let Some(function) =
+                        self.catalog.resolve_builtin_table_function(table)
+                    {
+                        return Ok(ResolvedEntry::Entry(CatalogEntry::Function(function)));
+                    }
+                }
             }
             TableReference::Full {
                 catalog,
@@ -151,6 +182,20 @@ impl<'a> EntryResolver<'a> {
 
         Err(ResolveError(format!("failed to find table: {reference}")))
     }
+}
+
+/// Names of builtin TableReturning functions that real Postgres exposes
+/// under `information_schema` or `pg_catalog`. Used by the schema-
+/// qualified resolver to allow `information_schema._pg_expandarray(...)`
+/// while keeping non-PG table functions (`read_parquet`, `delta_scan`,
+/// etc.) out of those reserved namespaces.
+///
+/// Add to this list when introducing a new PG-compat SRF (e.g.
+/// `pg_get_keywords` once it lands).
+const PG_COMPAT_TABLE_FUNCS: &[&str] = &["_pg_expandarray"];
+
+fn is_pg_compat_table_func(name: &str) -> bool {
+    PG_COMPAT_TABLE_FUNCS.contains(&name)
 }
 
 #[cfg(test)]
