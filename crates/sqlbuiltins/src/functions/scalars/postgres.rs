@@ -1170,6 +1170,401 @@ impl BuiltinScalarUDF for HasColumnPrivilege {
     }
 }
 
+// ----- has_type_privilege / has_function_privilege ---------------------------
+// Same shape as `has_table_privilege` / `has_column_privilege` — always
+// return true. PgJDBC's `getTypeInfo` and `getFunctions` fall through
+// these only when `hideUnprivilegedObjects=true` is set; without these
+// stubs the connection still works but the metadata calls log a
+// SQLException visible in app logs. psycopg3 also probes
+// `has_type_privilege` during its custom-type discovery path.
+#[derive(Clone, Copy, Debug)]
+pub struct HasTypePrivilege;
+
+impl ConstBuiltinFunction for HasTypePrivilege {
+    const NAME: &'static str = "has_type_privilege";
+    const DESCRIPTION: &'static str = "Returns true if user has privilege for type";
+    const EXAMPLE: &'static str = "has_type_privilege('user', 'integer', 'USAGE')";
+    const FUNCTION_TYPE: FunctionType = FunctionType::Scalar;
+    fn signature(&self) -> Option<Signature> {
+        Some(Signature::one_of(
+            vec![
+                // (privilege_type) — single-arg form bound to current user
+                TypeSignature::Exact(vec![DataType::Utf8]),
+                // (oid_or_name, privilege_type)
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Int64, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Int32, DataType::Utf8]),
+                // (user, oid_or_name, privilege_type)
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Int64, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Int32, DataType::Utf8]),
+            ],
+            Volatility::Stable,
+        ))
+    }
+}
+
+impl BuiltinScalarUDF for HasTypePrivilege {
+    fn try_as_expr(&self, _: &SessionCatalog, args: Vec<Expr>) -> DataFusionResult<Expr> {
+        Ok(simple_const_udf(
+            Self::NAME,
+            ConstBuiltinFunction::signature(self).unwrap(),
+            DataType::Boolean,
+            ScalarValue::Boolean(Some(true)),
+            args,
+        ))
+    }
+    fn namespace(&self) -> FunctionNamespace {
+        PG_CATALOG_NAMESPACE
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct HasFunctionPrivilege;
+
+impl ConstBuiltinFunction for HasFunctionPrivilege {
+    const NAME: &'static str = "has_function_privilege";
+    const DESCRIPTION: &'static str = "Returns true if user has privilege for function";
+    const EXAMPLE: &'static str = "has_function_privilege('user', 'now()', 'EXECUTE')";
+    const FUNCTION_TYPE: FunctionType = FunctionType::Scalar;
+    fn signature(&self) -> Option<Signature> {
+        Some(Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Int64, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Int32, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Int64, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Int32, DataType::Utf8]),
+            ],
+            Volatility::Stable,
+        ))
+    }
+}
+
+impl BuiltinScalarUDF for HasFunctionPrivilege {
+    fn try_as_expr(&self, _: &SessionCatalog, args: Vec<Expr>) -> DataFusionResult<Expr> {
+        Ok(simple_const_udf(
+            Self::NAME,
+            ConstBuiltinFunction::signature(self).unwrap(),
+            DataType::Boolean,
+            ScalarValue::Boolean(Some(true)),
+            args,
+        ))
+    }
+    fn namespace(&self) -> FunctionNamespace {
+        PG_CATALOG_NAMESPACE
+    }
+}
+
+// ----- pg_has_role -----------------------------------------------------------
+// PG-spec roles function. PgJDBC's `getTablePrivileges` calls
+// `pg_has_role(rolname, 'USAGE')` to filter table privileges by role
+// membership. Always-true matches our open-permissions model.
+#[derive(Clone, Copy, Debug)]
+pub struct PgHasRole;
+
+impl ConstBuiltinFunction for PgHasRole {
+    const NAME: &'static str = "pg_has_role";
+    const DESCRIPTION: &'static str = "Returns true if user has membership in role";
+    const EXAMPLE: &'static str = "pg_has_role('user', 'role', 'USAGE')";
+    const FUNCTION_TYPE: FunctionType = FunctionType::Scalar;
+    fn signature(&self) -> Option<Signature> {
+        Some(Signature::one_of(
+            vec![
+                // (role, privilege)
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Int64, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Int32, DataType::Utf8]),
+                // (user, role, privilege)
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Int64, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Int32, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Int64, DataType::Int64, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Int32, DataType::Int32, DataType::Utf8]),
+            ],
+            Volatility::Stable,
+        ))
+    }
+}
+
+impl BuiltinScalarUDF for PgHasRole {
+    fn try_as_expr(&self, _: &SessionCatalog, args: Vec<Expr>) -> DataFusionResult<Expr> {
+        Ok(simple_const_udf(
+            Self::NAME,
+            ConstBuiltinFunction::signature(self).unwrap(),
+            DataType::Boolean,
+            ScalarValue::Boolean(Some(true)),
+            args,
+        ))
+    }
+    fn namespace(&self) -> FunctionNamespace {
+        PG_CATALOG_NAMESPACE
+    }
+}
+
+// ----- to_regclass / to_regtype / to_regproc ---------------------------------
+// `to_regX(text) -> oid` family. Real PG looks up the named object in
+// the catalog and returns its OID, or NULL if not found. psycopg3's
+// `_get_info_query` uses these for case-insensitive type discovery.
+//
+// Our impl: case-by-case for `to_regtype` (uses the static PG_TYPES
+// lookup), simple stubs returning NULL for `to_regclass` and
+// `to_regproc` until a SessionCatalog-aware implementation lands.
+// Returning NULL on miss is the spec-correct behaviour.
+#[derive(Clone, Copy, Debug)]
+pub struct ToRegtype;
+
+impl ConstBuiltinFunction for ToRegtype {
+    const NAME: &'static str = "to_regtype";
+    const DESCRIPTION: &'static str =
+        "Postgres `to_regtype(text) -> oid` — resolve a type name to its OID, NULL on miss.";
+    const EXAMPLE: &'static str = "to_regtype('integer')";
+    const FUNCTION_TYPE: FunctionType = FunctionType::Scalar;
+    fn signature(&self) -> Option<Signature> {
+        Some(Signature::exact(
+            vec![DataType::Utf8],
+            Volatility::Stable,
+        ))
+    }
+}
+
+impl BuiltinScalarUDF for ToRegtype {
+    fn try_as_expr(&self, _: &SessionCatalog, args: Vec<Expr>) -> DataFusionResult<Expr> {
+        let return_type_fn: ReturnTypeFunction = Arc::new(|_| Ok(Arc::new(DataType::Int32)));
+        let scalar_fn_impl: ScalarFunctionImplementation = Arc::new(move |input| {
+            Ok(get_nth_scalar_value(input, 0, &|value| -> Result<
+                ScalarValue,
+                BuiltinError,
+            > {
+                match value {
+                    ScalarValue::Utf8(Some(name)) => {
+                        // Real PG accepts both the short typname
+                        // (`"int4"`) and the human alias
+                        // (`"integer"`). Try short first; if no
+                        // hit, retry with reverse-aliased name.
+                        let oid = pgrepr::pg_type_oid::pg_type_by_name(&name)
+                            .map(|t| t.oid as i32)
+                            .or_else(|| {
+                                let canonical = match name.as_str() {
+                                    "boolean" => "bool",
+                                    "smallint" => "int2",
+                                    "integer" | "int" => "int4",
+                                    "bigint" => "int8",
+                                    "real" => "float4",
+                                    "double precision" => "float8",
+                                    "decimal" => "numeric",
+                                    "character" => "bpchar",
+                                    "character varying" => "varchar",
+                                    "time with time zone" => "timetz",
+                                    "timestamp with time zone" => "timestamptz",
+                                    other => other,
+                                };
+                                pgrepr::pg_type_oid::pg_type_by_name(canonical)
+                                    .map(|t| t.oid as i32)
+                            });
+                        Ok(match oid {
+                            Some(o) => ScalarValue::Int32(Some(o)),
+                            None => ScalarValue::Int32(None),
+                        })
+                    }
+                    _ => Ok(ScalarValue::Int32(None)),
+                }
+            })?)
+        });
+        let udf = ScalarUDF::new(
+            Self::NAME,
+            &ConstBuiltinFunction::signature(self).unwrap(),
+            &return_type_fn,
+            &scalar_fn_impl,
+        );
+        Ok(Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::new(udf),
+            args,
+        )))
+    }
+    fn namespace(&self) -> FunctionNamespace {
+        PG_CATALOG_NAMESPACE
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ToRegclass;
+
+impl ConstBuiltinFunction for ToRegclass {
+    const NAME: &'static str = "to_regclass";
+    const DESCRIPTION: &'static str =
+        "Postgres `to_regclass(text) -> oid` — resolve a relation name to its OID. NULL stub (catalog lookup deferred).";
+    const EXAMPLE: &'static str = "to_regclass('pg_class')";
+    const FUNCTION_TYPE: FunctionType = FunctionType::Scalar;
+    fn signature(&self) -> Option<Signature> {
+        Some(Signature::exact(
+            vec![DataType::Utf8],
+            Volatility::Stable,
+        ))
+    }
+}
+
+impl BuiltinScalarUDF for ToRegclass {
+    fn try_as_expr(&self, _: &SessionCatalog, args: Vec<Expr>) -> DataFusionResult<Expr> {
+        Ok(simple_const_udf(
+            Self::NAME,
+            ConstBuiltinFunction::signature(self).unwrap(),
+            DataType::Int32,
+            ScalarValue::Int32(None),
+            args,
+        ))
+    }
+    fn namespace(&self) -> FunctionNamespace {
+        PG_CATALOG_NAMESPACE
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ToRegproc;
+
+impl ConstBuiltinFunction for ToRegproc {
+    const NAME: &'static str = "to_regproc";
+    const DESCRIPTION: &'static str =
+        "Postgres `to_regproc(text) -> oid` — resolve a function name to its OID. NULL stub.";
+    const EXAMPLE: &'static str = "to_regproc('now')";
+    const FUNCTION_TYPE: FunctionType = FunctionType::Scalar;
+    fn signature(&self) -> Option<Signature> {
+        Some(Signature::exact(
+            vec![DataType::Utf8],
+            Volatility::Stable,
+        ))
+    }
+}
+
+impl BuiltinScalarUDF for ToRegproc {
+    fn try_as_expr(&self, _: &SessionCatalog, args: Vec<Expr>) -> DataFusionResult<Expr> {
+        Ok(simple_const_udf(
+            Self::NAME,
+            ConstBuiltinFunction::signature(self).unwrap(),
+            DataType::Int32,
+            ScalarValue::Int32(None),
+            args,
+        ))
+    }
+    fn namespace(&self) -> FunctionNamespace {
+        PG_CATALOG_NAMESPACE
+    }
+}
+
+// ----- pg_my_temp_schema -----------------------------------------------------
+// Real PG returns the OID of the session's temp namespace. We don't
+// distinguish a temp namespace today; return 0 (InvalidOid) so callers
+// see "no temp objects" rather than erroring.
+#[derive(Clone, Copy, Debug)]
+pub struct PgMyTempSchema;
+
+impl ConstBuiltinFunction for PgMyTempSchema {
+    const NAME: &'static str = "pg_my_temp_schema";
+    const DESCRIPTION: &'static str =
+        "Postgres `pg_my_temp_schema()` — OID of the current session's temp namespace, or 0.";
+    const EXAMPLE: &'static str = "pg_my_temp_schema()";
+    const FUNCTION_TYPE: FunctionType = FunctionType::Scalar;
+    fn signature(&self) -> Option<Signature> {
+        Some(Signature::exact(vec![], Volatility::Stable))
+    }
+}
+
+impl BuiltinScalarUDF for PgMyTempSchema {
+    fn try_as_expr(&self, _: &SessionCatalog, args: Vec<Expr>) -> DataFusionResult<Expr> {
+        Ok(simple_const_udf(
+            Self::NAME,
+            ConstBuiltinFunction::signature(self).unwrap(),
+            DataType::Int32,
+            ScalarValue::Int32(Some(0)),
+            args,
+        ))
+    }
+    fn namespace(&self) -> FunctionNamespace {
+        PG_CATALOG_NAMESPACE
+    }
+}
+
+// ----- pg_size_pretty --------------------------------------------------------
+// `pg_size_pretty(bigint) -> text`. Real PG renders byte counts as
+// `'24 kB'`, `'1024 MB'`, etc. DBeaver's table-size column calls
+// `pg_size_pretty(pg_total_relation_size(oid))` — without this the
+// column reads "<unknown>".
+#[derive(Clone, Copy, Debug)]
+pub struct PgSizePretty;
+
+impl ConstBuiltinFunction for PgSizePretty {
+    const NAME: &'static str = "pg_size_pretty";
+    const DESCRIPTION: &'static str =
+        "Postgres `pg_size_pretty(bigint) -> text` — format byte count as human-readable string.";
+    const EXAMPLE: &'static str = "pg_size_pretty(1048576::bigint) -- '1024 kB'";
+    const FUNCTION_TYPE: FunctionType = FunctionType::Scalar;
+    fn signature(&self) -> Option<Signature> {
+        Some(Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Int64]),
+                TypeSignature::Exact(vec![DataType::Int32]),
+            ],
+            Volatility::Immutable,
+        ))
+    }
+}
+
+/// Format a byte count the way real PG `pg_size_pretty` does.
+/// Crosses thresholds at 10 KiB / 10 MiB / 10 GiB / 10 TiB to switch
+/// units, with 0 fractional digits — matches upstream `numeric_to_pg_size`.
+fn pg_size_pretty_inner(bytes: i64) -> String {
+    const KB: i64 = 1024;
+    const MB: i64 = 1024 * KB;
+    const GB: i64 = 1024 * MB;
+    const TB: i64 = 1024 * GB;
+    let abs = bytes.unsigned_abs() as i128;
+    if abs < 10 * KB as i128 {
+        format!("{bytes} bytes")
+    } else if abs < 10 * MB as i128 {
+        format!("{} kB", bytes / KB)
+    } else if abs < 10 * GB as i128 {
+        format!("{} MB", bytes / MB)
+    } else if abs < 10 * TB as i128 {
+        format!("{} GB", bytes / GB)
+    } else {
+        format!("{} TB", bytes / TB)
+    }
+}
+
+impl BuiltinScalarUDF for PgSizePretty {
+    fn try_as_expr(&self, _: &SessionCatalog, args: Vec<Expr>) -> DataFusionResult<Expr> {
+        let return_type_fn: ReturnTypeFunction = Arc::new(|_| Ok(Arc::new(DataType::Utf8)));
+        let scalar_fn_impl: ScalarFunctionImplementation = Arc::new(move |input| {
+            Ok(get_nth_scalar_value(input, 0, &|value| -> Result<
+                ScalarValue,
+                BuiltinError,
+            > {
+                let bytes: i64 = match value {
+                    ScalarValue::Int64(Some(b)) => *b,
+                    ScalarValue::Int32(Some(b)) => *b as i64,
+                    _ => return Ok(ScalarValue::Utf8(None)),
+                };
+                Ok(ScalarValue::Utf8(Some(pg_size_pretty_inner(bytes))))
+            })?)
+        });
+        let udf = ScalarUDF::new(
+            Self::NAME,
+            &ConstBuiltinFunction::signature(self).unwrap(),
+            &return_type_fn,
+            &scalar_fn_impl,
+        );
+        Ok(Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::new(udf),
+            args,
+        )))
+    }
+    fn namespace(&self) -> FunctionNamespace {
+        PG_CATALOG_NAMESPACE
+    }
+}
+
 // ----- obj_description / col_description / shobj_description -----------------
 // `obj_description(oid, 'pg_class')` is the canonical Postgres helper for
 // "give me the comment for this object". DBeaver emits it in its

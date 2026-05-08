@@ -244,3 +244,100 @@ query T
 SELECT format_type(1700::int, NULL::int);
 ----
 numeric
+
+# pg_size_pretty(bigint) — human-readable byte counts. DBeaver's
+# table-size column reads this; was missing entirely before.
+query T
+SELECT pg_size_pretty(0::bigint);
+----
+0 bytes
+
+query T
+SELECT pg_size_pretty(1024::bigint);
+----
+1024 bytes
+
+query T
+SELECT pg_size_pretty(20480::bigint);
+----
+20 kB
+
+query T
+SELECT pg_size_pretty(1048576::bigint);
+----
+1024 kB
+
+query T
+SELECT pg_size_pretty(20971520::bigint);
+----
+20 MB
+
+# to_regtype(text) — PG-spec name → OID resolver. NULL on miss.
+query I
+SELECT to_regtype('integer');
+----
+23
+
+query I
+SELECT to_regtype('int4');
+----
+23
+
+query I
+SELECT to_regtype('text');
+----
+25
+
+query I
+SELECT to_regtype('bigint');
+----
+20
+
+query T
+SELECT to_regtype('not-a-real-type') IS NULL;
+----
+t
+
+# to_regclass / to_regproc — NULL stubs (catalog lookup deferred).
+query T
+SELECT to_regclass('pg_class') IS NULL;
+----
+t
+
+query T
+SELECT to_regproc('now') IS NULL;
+----
+t
+
+# pg_my_temp_schema — always 0 (no temp namespaces).
+query I
+SELECT pg_my_temp_schema();
+----
+0
+
+# pg_has_role — always true (open permissions model).
+query T
+SELECT pg_has_role('glaredb', 'USAGE');
+----
+t
+
+query T
+SELECT pg_has_role('user', 'role', 'USAGE');
+----
+t
+
+# has_type_privilege / has_function_privilege — always true.
+query T
+SELECT has_type_privilege('integer', 'USAGE');
+----
+t
+
+query T
+SELECT has_type_privilege('user', 'integer', 'USAGE');
+----
+t
+
+query T
+SELECT has_function_privilege('user', 'now()', 'EXECUTE');
+----
+t

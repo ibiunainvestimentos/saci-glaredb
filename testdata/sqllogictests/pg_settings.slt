@@ -34,3 +34,16 @@ WHERE setting IS NOT NULL AND vartype = 'string'
 LIMIT 1;
 ----
 server_version
+
+# `max_index_keys` synthetic row (A11) — PgJDBC's
+# `getMaxIndexKeys` reads this once per `Connection.getMetaData()`
+# call. Without it, a SQLException is logged at WARN.
+query T
+SELECT setting FROM pg_catalog.pg_settings WHERE name = 'max_index_keys';
+----
+32
+
+query T
+SELECT vartype FROM pg_catalog.pg_settings WHERE name = 'max_index_keys';
+----
+integer

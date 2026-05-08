@@ -835,6 +835,9 @@ SELECT
     'en_US.UTF-8'                    AS datcollate,
     'en_US.UTF-8'                    AS datctype,
     CAST(NULL AS TEXT)               AS daticulocal,
+    -- `daticurules` (PG 16+) — ICU locale rules. NULL when the
+    -- collation provider is not ICU (we use libc).
+    CAST(NULL AS TEXT)               AS daticurules,
     CAST(NULL AS TEXT)               AS datcollversion,
     CAST(NULL AS TEXT)               AS datacl
 FROM glare_catalog.databases
@@ -854,6 +857,9 @@ SELECT
     'en_US.UTF-8'                    AS datcollate,
     'en_US.UTF-8'                    AS datctype,
     CAST(NULL AS TEXT)               AS daticulocal,
+    -- `daticurules` (PG 16+) — ICU locale rules. NULL when the
+    -- collation provider is not ICU (we use libc).
+    CAST(NULL AS TEXT)               AS daticurules,
     CAST(NULL AS TEXT)               AS datcollversion,
     CAST(NULL AS TEXT)               AS datacl
 WHERE current_database() NOT IN
@@ -899,7 +905,26 @@ pub static PG_TYPE: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     //
     // The full lookup table lives in `pgrepr::pg_type_oid::PG_TYPES`; this
     // SQL view is a hand-mirror suitable for SQL queries. Keep them aligned.
+    //
+    // Full PG 16 column shape — the IO/subscript/handler OIDs (typinput,
+    // typoutput, typreceive, typsend, typmodin, typmodout, typanalyze,
+    // typsubscript) point at C-language handler procs in real PG. We
+    // emit `0` / NULL for them since GlareDB has no per-type C handlers;
+    // DBeaver checks "is the OID nonzero?" rather than calling them.
     sql: "
+SELECT t.*,
+    CAST(0 AS INT)     AS typsubscript,
+    CAST(0 AS INT)     AS typinput,
+    CAST(0 AS INT)     AS typoutput,
+    CAST(0 AS INT)     AS typreceive,
+    CAST(0 AS INT)     AS typsend,
+    CAST(0 AS INT)     AS typmodin,
+    CAST(0 AS INT)     AS typmodout,
+    CAST(0 AS INT)     AS typanalyze,
+    CAST(0 AS INT)     AS typndims,
+    CAST(NULL AS TEXT) AS typdefaultbin,
+    CAST(NULL AS TEXT) AS typacl
+FROM (
 SELECT * FROM (VALUES
     -- (oid, typname, typnamespace, typlen, typbyval, typtype, typcategory, typispreferred, typisdefined, typdelim, typrelid, typelem, typarray, typalign, typstorage, typnotnull, typbasetype, typtypmod, typowner, typdefault, typcollation)
     (CAST(16 AS INT),   'bool',         CAST(11 AS INT), CAST(1 AS SMALLINT),  true,  'b', 'B', true,  true, ',', CAST(0 AS INT), CAST(0 AS INT),    CAST(1000 AS INT), 'c', 'p', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
@@ -948,7 +973,8 @@ SELECT * FROM (VALUES
     (CAST(199 AS INT),  '_json',        CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(114 AS INT),  CAST(0 AS INT),    'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
     (CAST(2951 AS INT), '_uuid',        CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(2950 AS INT), CAST(0 AS INT),    'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT)),
     (CAST(3807 AS INT), '_jsonb',       CAST(11 AS INT), CAST(-1 AS SMALLINT), false, 'b', 'A', false, true, ',', CAST(0 AS INT), CAST(3802 AS INT), CAST(0 AS INT),    'i', 'x', false, CAST(0 AS INT), CAST(-1 AS INT), CAST(10 AS INT), CAST(NULL AS TEXT), CAST(0 AS INT))
-) AS t(oid, typname, typnamespace, typlen, typbyval, typtype, typcategory, typispreferred, typisdefined, typdelim, typrelid, typelem, typarray, typalign, typstorage, typnotnull, typbasetype, typtypmod, typowner, typdefault, typcollation)",
+) AS t(oid, typname, typnamespace, typlen, typbyval, typtype, typcategory, typispreferred, typisdefined, typdelim, typrelid, typelem, typarray, typalign, typstorage, typnotnull, typbasetype, typtypmod, typowner, typdefault, typcollation)
+) AS t",
 });
 
 pub static PG_PROC: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
@@ -1003,6 +1029,9 @@ SELECT
     -- `proallargtypes` mirrors `proargtypes` since we don't
     -- distinguish OUT/INOUT parameters today.
     f.argument_oids_text                       AS proallargtypes,
+    -- `prosqlbody` (PG 16+) — SQL function body for SQL-LANGUAGE
+    -- functions; NULL for the C/internal-language functions we ship.
+    CAST(NULL AS TEXT)                         AS prosqlbody,
     CAST(NULL AS TEXT)                         AS proargmodes,
     -- proargnames is `text[]` in real Postgres — argument *names*
     -- (NULL when the function uses positional-only args). The source
@@ -1095,6 +1124,9 @@ SELECT
     CAST(0 AS SMALLINT) AS indnatts,
     CAST(0 AS SMALLINT) AS indnkeyatts,
     i.is_unique         AS indisunique,
+    -- `indnullsnotdistinct` (PG 15+) — column position 6 in upstream
+    -- pg_index.h. Always false; we don't model UNIQUE NULL semantics.
+    false               AS indnullsnotdistinct,
     i.is_primary        AS indisprimary,
     false               AS indisexclusion,
     false               AS indimmediate,
@@ -1270,12 +1302,14 @@ SELECT * FROM (VALUES
 pub static PG_COLLATION: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     schema: POSTGRES_SCHEMA,
     name: "pg_collation",
+    // `collicurules` added in PG 16 — ICU locale-rule overrides. NULL
+    // for our libc-collations.
     sql: "
 SELECT * FROM (VALUES
-    (CAST(100 AS INT), 'default', CAST(11 AS INT), CAST(10 AS INT), 'd', true, CAST(-1 AS INT), CAST(NULL AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS TEXT)),
-    (CAST(950 AS INT), 'C',       CAST(11 AS INT), CAST(10 AS INT), 'c', true, CAST(-1 AS INT), 'C', 'C', CAST(NULL AS TEXT), CAST(NULL AS TEXT)),
-    (CAST(951 AS INT), 'POSIX',   CAST(11 AS INT), CAST(10 AS INT), 'c', true, CAST(-1 AS INT), 'POSIX', 'POSIX', CAST(NULL AS TEXT), CAST(NULL AS TEXT))
-) AS c(oid, collname, collnamespace, collowner, collprovider, collisdeterministic, collencoding, collcollate, collctype, colliculocale, collversion)",
+    (CAST(100 AS INT), 'default', CAST(11 AS INT), CAST(10 AS INT), 'd', true, CAST(-1 AS INT), CAST(NULL AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS TEXT)),
+    (CAST(950 AS INT), 'C',       CAST(11 AS INT), CAST(10 AS INT), 'c', true, CAST(-1 AS INT), 'C', 'C', CAST(NULL AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS TEXT)),
+    (CAST(951 AS INT), 'POSIX',   CAST(11 AS INT), CAST(10 AS INT), 'c', true, CAST(-1 AS INT), 'POSIX', 'POSIX', CAST(NULL AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS TEXT))
+) AS c(oid, collname, collnamespace, collowner, collprovider, collisdeterministic, collencoding, collcollate, collctype, colliculocale, collicurules, collversion)",
 });
 
 pub static PG_LANGUAGE: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
@@ -1325,7 +1359,29 @@ SELECT
     CAST(NULL AS TEXT)     AS sourcefile,
     CAST(NULL AS INT)      AS sourceline,
     false                  AS pending_restart
-FROM glare_catalog.session_vars",
+FROM glare_catalog.session_vars
+UNION ALL
+-- `max_index_keys` — read by PgJDBC `getMaxIndexKeys` on every
+-- `Connection.getMetaData()` call. Without this row the call logs a
+-- SQLException at WARN. Real PG hardcodes this to 32 in pg_settings.
+SELECT
+    'max_index_keys'       AS name,
+    '32'                   AS setting,
+    CAST(NULL AS TEXT)     AS unit,
+    'Preset Options'       AS category,
+    'Shows the maximum number of index keys.' AS short_desc,
+    CAST(NULL AS TEXT)     AS extra_desc,
+    'internal'             AS context,
+    'integer'              AS vartype,
+    'default'              AS source,
+    '32'                   AS min_val,
+    '32'                   AS max_val,
+    CAST(NULL AS TEXT)     AS enumvals,
+    '32'                   AS boot_val,
+    '32'                   AS reset_val,
+    CAST(NULL AS TEXT)     AS sourcefile,
+    CAST(NULL AS INT)      AS sourceline,
+    false                  AS pending_restart",
 });
 
 pub static PG_EXTENSION: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
