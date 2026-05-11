@@ -687,7 +687,8 @@ pub static PG_CLASS: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
 SELECT
     t.oid                                                    AS oid,
     t.table_name                                             AS relname,
-    t.schema_oid                                             AS relnamespace,
+    CASE t.schema_oid WHEN 16388 THEN 11 WHEN 16386 THEN 2200
+         ELSE t.schema_oid END                               AS relnamespace,
     CAST(0 AS INT)                                           AS reltype,
     CAST(0 AS INT)                                           AS reloftype,
     CAST(10 AS INT)                                          AS relowner,
@@ -724,7 +725,8 @@ UNION ALL
 SELECT
     v.oid                                                    AS oid,
     v.view_name                                              AS relname,
-    v.schema_oid                                             AS relnamespace,
+    CASE v.schema_oid WHEN 16388 THEN 11 WHEN 16386 THEN 2200
+         ELSE v.schema_oid END                               AS relnamespace,
     CAST(0 AS INT)                                           AS reltype,
     CAST(0 AS INT)                                           AS reloftype,
     CAST(10 AS INT)                                          AS relowner,
@@ -761,9 +763,22 @@ FROM glare_catalog.views v",
 pub static PG_NAMESPACE: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
     schema: POSTGRES_SCHEMA,
     name: "pg_namespace",
+    // Translate well-known schemas to their upstream-canonical OIDs so
+    // that any client code hardcoding `pg_catalog.oid = 11` /
+    // `public.oid = 2200` (psycopg3 TypeInfo, asyncpg `_TYPEINFO`,
+    // PgJDBC `getMaxNameLength`, every DBeaver introspection probe)
+    // can JOIN against pg_namespace by OID and find a match.
+    // `pg_type.typnamespace` is already hardcoded to 11 for built-in
+    // types — without this translation that FK breaks. Internal
+    // storage in `glare_catalog.schemas.oid` keeps the 16385-16389
+    // range; only the public-facing view does the renumber.
     sql: "
 SELECT
-    s.oid                  AS oid,
+    CASE s.schema_name
+        WHEN 'pg_catalog' THEN 11
+        WHEN 'public' THEN 2200
+        ELSE s.oid
+    END                    AS oid,
     s.schema_name          AS nspname,
     CAST(10 AS INT)        AS nspowner,
     CAST(NULL AS TEXT)     AS nspacl
@@ -990,7 +1005,8 @@ pub static PG_PROC: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
 SELECT
     f.oid                                      AS oid,
     f.function_name                            AS proname,
-    f.schema_oid                               AS pronamespace,
+    CASE f.schema_oid WHEN 16388 THEN 11 WHEN 16386 THEN 2200
+         ELSE f.schema_oid END                  AS pronamespace,
     CAST(10 AS INT)                            AS proowner,
     CAST(12 AS INT)                            AS prolang,
     CAST(0.0 AS REAL)                          AS procost,
@@ -1161,7 +1177,8 @@ pub static PG_CONSTRAINT: Lazy<BuiltinView> = Lazy::new(|| BuiltinView {
 SELECT
     c.oid                       AS oid,
     c.conname                   AS conname,
-    c.schema_oid                AS connamespace,
+    CASE c.schema_oid WHEN 16388 THEN 11 WHEN 16386 THEN 2200
+         ELSE c.schema_oid END   AS connamespace,
     c.contype                   AS contype,
     c.is_deferrable             AS condeferrable,
     c.is_deferred               AS condeferred,
