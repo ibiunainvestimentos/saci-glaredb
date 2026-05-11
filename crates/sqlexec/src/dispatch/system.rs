@@ -676,7 +676,12 @@ impl<'a> SystemTableDispatcher<'a> {
             } else {
                 parameters.append_value(EMPTY);
                 argument_types.append_value(EMPTY);
-                argument_oids_text.append_null();
+                // Functions registered without a `signature` (many DataFusion
+                // built-ins) still need `proargtypes` non-NULL — PgJDBC's
+                // tokenizer counts positions and NULL breaks
+                // `getFunctionColumns`. Emit empty string ("zero positional
+                // args") to keep the contract identical to nullary-Exact.
+                argument_oids_text.append_value("");
             }
 
             builtin.append_value(func.builtin);

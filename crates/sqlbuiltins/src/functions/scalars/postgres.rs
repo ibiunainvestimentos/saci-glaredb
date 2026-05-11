@@ -603,12 +603,20 @@ impl ConstBuiltinFunction for FormatType {
     const FUNCTION_TYPE: FunctionType = FunctionType::Scalar;
 
     fn signature(&self) -> Option<Signature> {
-        // PG's signature is `(oid, integer)`. Drivers also call with
-        // `(oid, NULL::int)` and sometimes `(int4, NULL)` literally.
-        // Accept Int32 + Int32 (typmod nullable). PgJDBC sends the
-        // oid as `int4` after coercion.
-        Some(Signature::exact(
-            vec![DataType::Int32, DataType::Int32],
+        // PG's signature is `(oid, integer)`. Drivers send `int4` via
+        // typed binds, but DataFusion types bare SQL int literals as
+        // `Int64` so `SELECT format_type(23, NULL)` would otherwise
+        // fail coercion. Accept the cross-product of {Int32, Int64} so
+        // both wire-typed and literal-typed calls resolve. PgJDBC/
+        // psycopg paths land on Int32+Int32; interactive psql lands on
+        // Int64+Int64.
+        Some(Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Int32, DataType::Int32]),
+                TypeSignature::Exact(vec![DataType::Int64, DataType::Int32]),
+                TypeSignature::Exact(vec![DataType::Int32, DataType::Int64]),
+                TypeSignature::Exact(vec![DataType::Int64, DataType::Int64]),
+            ],
             Volatility::Stable,
         ))
     }
@@ -682,16 +690,18 @@ impl BuiltinScalarUDF for FormatType {
     fn try_as_expr(&self, _: &SessionCatalog, args: Vec<Expr>) -> DataFusionResult<Expr> {
         let return_type_fn: ReturnTypeFunction = Arc::new(|_| Ok(Arc::new(DataType::Utf8)));
         let scalar_fn_impl: ScalarFunctionImplementation = Arc::new(move |input| {
-            // Two-arg call: (oid::int4, typmod::int4|NULL). The
-            // `get_nth_scalar_value` helper used elsewhere only reads
-            // one arg, so unpack manually and broadcast across the
-            // input's row count when scalars are supplied.
+            // Two-arg call: (oid::int4|int8, typmod::int4|int8|NULL).
+            // Signature accepts the Int32/Int64 cross-product so cast
+            // both args to Int32 here for uniform handling.
             use datafusion::arrow::array::{Array, StringBuilder};
+            use datafusion::arrow::compute::cast;
             use datafusion::common::cast::as_int32_array;
 
             let arrays = ColumnarValue::values_to_arrays(input)?;
-            let oid_arr = as_int32_array(&arrays[0])?;
-            let mod_arr = as_int32_array(&arrays[1])?;
+            let oid_cast = cast(&arrays[0], &DataType::Int32)?;
+            let mod_cast = cast(&arrays[1], &DataType::Int32)?;
+            let oid_arr = as_int32_array(&oid_cast)?;
+            let mod_arr = as_int32_array(&mod_cast)?;
             let len = oid_arr.len();
 
             let mut out = StringBuilder::with_capacity(len, len * 16);
