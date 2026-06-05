@@ -5,7 +5,12 @@ use bytes::BytesMut;
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike};
 use chrono_tz::{Tz, TZ_VARIANTS};
 use datafusion::arrow::array::{Array, Float16Array};
-use datafusion::arrow::datatypes::{DataType as ArrowType, TimeUnit};
+use datafusion::arrow::datatypes::{
+    DataType as ArrowType,
+    IntervalDayTimeType,
+    IntervalMonthDayNanoType,
+    TimeUnit,
+};
 use datafusion::scalar::ScalarValue as DfScalar;
 use decimal::Decimal128;
 use once_cell::sync::Lazy;
@@ -46,6 +51,13 @@ pub enum Scalar {
     Time(NaiveTime),
     Date(NaiveDate),
     Decimal(Decimal128),
+    /// PostgreSQL `interval`, normalised to the PG triple. Arrow's three
+    /// interval encodings and `duration` all collapse into this.
+    Interval {
+        months: i32,
+        days: i32,
+        micros: i64,
+    },
     // A datafusion value that isn't yet supported by us. Ultimately we want to
     // remove this and error in case we don't support something explicitly.
     Other(DfScalar),
@@ -56,10 +68,10 @@ impl Scalar {
     pub fn try_from_array(
         array: &Arc<dyn Array>,
         row_idx: usize,
-        as_type: &PgType, // TODO: Type hints
+        as_type: &PgType,
     ) -> Result<Scalar> {
-        match DfScalar::try_from_array(array, row_idx) {
-            Ok(scalar) => Ok(Self::from_datafusion(scalar, as_type)),
+        let scalar = match DfScalar::try_from_array(array, row_idx) {
+            Ok(scalar) => Self::from_datafusion(scalar, as_type),
             Err(_) => {
                 // This data-type is not supported by arrow. Try to find a suitable
                 // conversion if possible, else error!
@@ -67,16 +79,46 @@ impl Scalar {
                     &ArrowType::Float16 => {
                         // To ScalarValue::Float32
                         let array = array.as_any().downcast_ref::<Float16Array>().unwrap();
-                        Ok(match array.is_null(row_idx) {
+                        match array.is_null(row_idx) {
                             true => Scalar::Null,
                             false => Scalar::Float4(array.value(row_idx).to_f32()),
-                        })
+                        }
                     }
-                    _ => Err(PgReprError::UnsupportedArrowType(
-                        array.data_type().to_owned(),
-                    )),
+                    _ => {
+                        return Err(PgReprError::UnsupportedArrowType(
+                            array.data_type().to_owned(),
+                        ))
+                    }
                 }
             }
+        };
+        // Coerce the numeric width to the *announced* pg type so the wire bytes
+        // always match the RowDescription OID. DataFusion can hand us a
+        // physically narrower array than the logical schema that drove the
+        // announcement — e.g. the literal `1` is logical `Int64` (announced
+        // int8 / oid 20) but materialises as an `Int32` array, which would
+        // otherwise write only 4 bytes and trip asyncpg's int8 decoder with
+        // "insufficient data in buffer: requested 8 remaining 4". The same
+        // applies to `MAX(CASE ... THEN 1 ELSE 0 END)`, `1 + 1`, etc.
+        Ok(scalar.coerce_numeric_to(as_type))
+    }
+
+    /// Widen/narrow an integer or float scalar so its encoded width matches the
+    /// PG type announced in the `RowDescription`. A no-op for already-matching
+    /// or non-numeric scalars. Narrowing arms exist only for completeness (the
+    /// observed divergence is always logical-wider-than-physical); they keep
+    /// wire framing consistent rather than ever desyncing the connection.
+    fn coerce_numeric_to(self, as_type: &PgType) -> Scalar {
+        match self {
+            Self::Int2(v) if *as_type == PgType::INT4 => Self::Int4(v as i32),
+            Self::Int2(v) if *as_type == PgType::INT8 => Self::Int8(v as i64),
+            Self::Int4(v) if *as_type == PgType::INT8 => Self::Int8(v as i64),
+            Self::Int4(v) if *as_type == PgType::INT2 => Self::Int2(v as i16),
+            Self::Int8(v) if *as_type == PgType::INT4 => Self::Int4(v as i32),
+            Self::Int8(v) if *as_type == PgType::INT2 => Self::Int2(v as i16),
+            Self::Float4(v) if *as_type == PgType::FLOAT8 => Self::Float8(v as f64),
+            Self::Float8(v) if *as_type == PgType::FLOAT4 => Self::Float4(v as f32),
+            other => other,
         }
     }
 
@@ -112,6 +154,11 @@ impl Scalar {
             Self::Time(v) => W::write_time(buf, v),
             Self::Date(v) => W::write_date(buf, v),
             Self::Decimal(v) => W::write_decimal(buf, v),
+            Self::Interval {
+                months,
+                days,
+                micros,
+            } => W::write_interval(buf, *months, *days, *micros),
             // If a type is not supported, we try to encode it as text.
             Self::Other(other) => W::write_any(buf, other),
         }
@@ -226,6 +273,79 @@ impl Scalar {
                 Self::Decimal(decimal)
             }
 
+            // Arrow Date64 is milliseconds since the Unix epoch; `arrow_to_pg_type`
+            // announces it as DATE (oid 1082) just like Date32, so encode the
+            // calendar date.
+            DfScalar::Date64(Some(v)) => Self::Date(
+                DateTime::from_timestamp_millis(v)
+                    .expect("Date64 value should be a valid date")
+                    .date_naive(),
+            ),
+
+            // Large/fixed text & binary share the wire encoding of their
+            // variable-length counterparts (announced as text / bytea).
+            DfScalar::LargeUtf8(Some(v)) => Self::Text(v),
+            DfScalar::LargeBinary(Some(v)) | DfScalar::FixedSizeBinary(_, Some(v)) => {
+                Self::Bytea(v)
+            }
+
+            // Decimal256 announces as PG numeric (oid 1700). Downcast to the
+            // i128-backed Decimal128 when the mantissa fits; out-of-range values
+            // fall through to `Scalar::Other` and surface as a clean per-row
+            // encode error (never a connection desync, thanks to the atomic
+            // codec + graceful stream_batch handling).
+            DfScalar::Decimal256(Some(v), precision, scale) => {
+                match v.to_i128().and_then(|m| Decimal128::new(m, scale).ok()) {
+                    Some(decimal) => Self::Decimal(decimal),
+                    None => Self::Other(DfScalar::Decimal256(Some(v), precision, scale)),
+                }
+            }
+
+            // Interval / Duration → PG `interval` (oid 1186), normalised to the
+            // (months, days, microseconds) triple. Arrow packs DayTime and
+            // MonthDayNano into a single integer; use the arrow helpers to unpack.
+            DfScalar::IntervalYearMonth(Some(v)) => Self::Interval {
+                months: v,
+                days: 0,
+                micros: 0,
+            },
+            DfScalar::IntervalDayTime(Some(v)) => {
+                let (days, millis) = IntervalDayTimeType::to_parts(v);
+                Self::Interval {
+                    months: 0,
+                    days,
+                    micros: millis as i64 * 1_000,
+                }
+            }
+            DfScalar::IntervalMonthDayNano(Some(v)) => {
+                let (months, days, nanos) = IntervalMonthDayNanoType::to_parts(v);
+                Self::Interval {
+                    months,
+                    days,
+                    micros: nanos / 1_000,
+                }
+            }
+            DfScalar::DurationSecond(Some(v)) => Self::Interval {
+                months: 0,
+                days: 0,
+                micros: v.saturating_mul(1_000_000),
+            },
+            DfScalar::DurationMillisecond(Some(v)) => Self::Interval {
+                months: 0,
+                days: 0,
+                micros: v.saturating_mul(1_000),
+            },
+            DfScalar::DurationMicrosecond(Some(v)) => Self::Interval {
+                months: 0,
+                days: 0,
+                micros: v,
+            },
+            DfScalar::DurationNanosecond(Some(v)) => Self::Interval {
+                months: 0,
+                days: 0,
+                micros: v / 1_000,
+            },
+
             // Nested types (Struct, List, LargeList, FixedSizeList) are serialised
             // as JSON text instead of falling through to DataFusion's struct-display
             // format, which is not parseable by any standard JSON consumer. The
@@ -238,6 +358,18 @@ impl Scalar {
                 | DfScalar::FixedSizeList(_)) => {
                 Self::Text(dfscalar_to_json(&v).to_string())
             }
+
+            // Dictionary<K, V> is a physical encoding of V. delta-rs emits
+            // DictionaryArray for partition columns on its scan path
+            // (`arrow_schema()` Dictionary-encodes them), so this arm is hit
+            // even when the catalog is clean. Unwrap to the inner ScalarValue
+            // and route through the per-type arms above — the OID announcement
+            // from `arrow_to_pg_type_info` already recurses identically, so the
+            // wire format matches client expectations. Without this arm,
+            // Dictionary fell through to `Scalar::Other` and
+            // `BinaryWriter::write_any` panicked ("no encoder for value"),
+            // killing the executor mid-batch and dropping the pg connection.
+            DfScalar::Dictionary(_, inner) => Self::from_datafusion(*inner, _as_type),
 
             other => {
                 debug_assert!(!other.is_null());
@@ -798,6 +930,69 @@ mod tests {
         }
     }
 
+    /// Regression: dictionary-encoded partition columns (`countrycode` on the
+    /// `rates_report_*` family) used to fall through to `Scalar::Other`,
+    /// which `BinaryWriter::write_any` rejects — panicking and dropping the
+    /// pg connection. Dictionary is a physical wrapper; the wire format
+    /// matches the value type, so unwrap recursively before routing through
+    /// the per-type arms.
+    #[test]
+    fn from_datafusion_dictionary_unwraps_to_value_type() {
+        let dict_scalar = DfScalar::Dictionary(
+            Box::new(DataType::UInt16),
+            Box::new(DfScalar::Utf8(Some("USA".to_string()))),
+        );
+        let scalar = Scalar::from_datafusion(dict_scalar, &PgType::TEXT);
+        match scalar {
+            Scalar::Text(s) => assert_eq!(s, "USA"),
+            other => panic!("expected Scalar::Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_datafusion_dictionary_unwraps_to_int4() {
+        let dict_scalar = DfScalar::Dictionary(
+            Box::new(DataType::UInt8),
+            Box::new(DfScalar::Int32(Some(42))),
+        );
+        let scalar = Scalar::from_datafusion(dict_scalar, &PgType::INT4);
+        match scalar {
+            Scalar::Int4(v) => assert_eq!(v, 42),
+            other => panic!("expected Scalar::Int4, got {other:?}"),
+        }
+    }
+
+    /// Nested dictionaries are unusual but well-defined — recursion peels
+    /// every layer until we hit a real scalar.
+    #[test]
+    fn from_datafusion_nested_dictionary_unwraps_recursively() {
+        let inner = DfScalar::Dictionary(
+            Box::new(DataType::UInt16),
+            Box::new(DfScalar::Utf8(Some("nested".to_string()))),
+        );
+        let outer = DfScalar::Dictionary(Box::new(DataType::UInt8), Box::new(inner));
+        let scalar = Scalar::from_datafusion(outer, &PgType::TEXT);
+        match scalar {
+            Scalar::Text(s) => assert_eq!(s, "nested"),
+            other => panic!("expected Scalar::Text, got {other:?}"),
+        }
+    }
+
+    /// A null dictionary value still routes through the same arm; the
+    /// outer `is_null()` short-circuit at the top of `from_datafusion`
+    /// catches the wrapper's null-ness first, so this exercises the inner
+    /// path (non-null wrapper, null inner is unreachable here because
+    /// `DfScalar::Dictionary(_, Box<inner>).is_null()` delegates to inner).
+    #[test]
+    fn from_datafusion_null_dictionary_returns_null() {
+        let dict_scalar = DfScalar::Dictionary(
+            Box::new(DataType::UInt16),
+            Box::new(DfScalar::Utf8(None)),
+        );
+        let scalar = Scalar::from_datafusion(dict_scalar, &PgType::TEXT);
+        assert!(matches!(scalar, Scalar::Null));
+    }
+
     // ---- UInt arms: pg_catalog `oid` columns are UInt32; binary clients
     //      (asyncpg, JDBC) need 4 BE bytes, not ASCII digits. Without
     //      these arms, UInt32 fell through to Scalar::Other and the
@@ -860,5 +1055,32 @@ mod tests {
             }
             other => panic!("expected Scalar::Int4 for UInt32, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn int32_array_announced_int8_coerces_to_8_wire_bytes() {
+        use bytes::BytesMut;
+        use datafusion::arrow::array::Int32Array;
+
+        use crate::writer::{BinaryWriter, Writer};
+
+        // Reproduces the `SELECT 1` failure: logical Int64 (announced int8 /
+        // oid 20) but a physically Int32 array. The value MUST encode as 8
+        // bytes to match the announced int8, otherwise asyncpg fails with
+        // "insufficient data in buffer: requested 8 remaining 4".
+        let arr: Arc<dyn Array> = Arc::new(Int32Array::from(vec![1]));
+
+        let scalar = Scalar::try_from_array(&arr, 0, &PgType::INT8).unwrap();
+        assert_eq!(scalar, Scalar::Int8(1));
+        let mut buf = BytesMut::new();
+        if let Scalar::Int8(v) = scalar {
+            BinaryWriter::write_int8(&mut buf, v).unwrap();
+        }
+        assert_eq!(buf.len(), 8, "int8-announced value must be 8 wire bytes");
+        assert_eq!(buf.as_ref(), 1_i64.to_be_bytes().as_ref());
+
+        // Sanity: the same array announced as int4 stays 4 bytes.
+        let s4 = Scalar::try_from_array(&arr, 0, &PgType::INT4).unwrap();
+        assert_eq!(s4, Scalar::Int4(1));
     }
 }

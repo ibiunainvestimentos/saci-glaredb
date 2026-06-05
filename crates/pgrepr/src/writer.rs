@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use chrono_tz::Tz;
 use decimal::Decimal128;
@@ -40,6 +40,11 @@ pub trait Writer {
     fn write_date(buf: &mut BytesMut, v: &NaiveDate) -> Result<()>;
 
     fn write_decimal(buf: &mut BytesMut, v: &Decimal128) -> Result<()>;
+
+    /// Write a PostgreSQL `interval` value. Arrow's three interval encodings
+    /// and `duration` are all normalised to the PG triple
+    /// `(months, days, microseconds)` by the caller.
+    fn write_interval(buf: &mut BytesMut, months: i32, days: i32, micros: i64) -> Result<()>;
 
     fn write_any<T: Display>(buf: &mut BytesMut, v: &T) -> Result<()> {
         encode_string(buf, v)?;
@@ -115,6 +120,51 @@ impl Writer for TextWriter {
         encode_decimal(buf, v)?;
         Ok(())
     }
+
+    fn write_interval(buf: &mut BytesMut, months: i32, days: i32, micros: i64) -> Result<()> {
+        encode_string(buf, &format_interval_text(months, days, micros))?;
+        Ok(())
+    }
+}
+
+/// Render an interval triple in PostgreSQL's default (`postgres`) interval
+/// style, e.g. `1 year 2 mons 3 days 04:05:06.5`. A zero interval renders
+/// `00:00:00`. Only used by the text writer — binary clients (asyncpg, JDBC)
+/// take the 16-byte path in [`BinaryWriter::write_interval`].
+fn format_interval_text(months: i32, days: i32, micros: i64) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let years = months / 12;
+    let mons = months % 12;
+    let plural = |n: i32| if n.abs() == 1 { "" } else { "s" };
+    if years != 0 {
+        parts.push(format!("{years} year{}", plural(years)));
+    }
+    if mons != 0 {
+        parts.push(format!("{mons} mon{}", plural(mons)));
+    }
+    if days != 0 {
+        parts.push(format!("{days} day{}", plural(days)));
+    }
+
+    if micros != 0 || parts.is_empty() {
+        let sign = if micros < 0 { "-" } else { "" };
+        let abs = micros.unsigned_abs();
+        let usecs = abs % 1_000_000;
+        let total_secs = abs / 1_000_000;
+        let secs = total_secs % 60;
+        let mins = (total_secs / 60) % 60;
+        let hours = total_secs / 3600;
+        let mut time = format!("{sign}{hours:02}:{mins:02}:{secs:02}");
+        if usecs != 0 {
+            // Trim trailing zeros in the fractional seconds, like PG.
+            let frac = format!("{usecs:06}");
+            time.push('.');
+            time.push_str(frac.trim_end_matches('0'));
+        }
+        parts.push(time);
+    }
+
+    parts.join(" ")
 }
 
 #[derive(Debug)]
@@ -185,10 +235,95 @@ impl Writer for BinaryWriter {
         put_to_sql!(buf, DATE, v)
     }
 
-    fn write_decimal(_buf: &mut BytesMut, _v: &Decimal128) -> Result<()> {
-        Err(PgReprError::InternalError(
-            "cannot encode decimal (numeric) value into PG binary".to_string(),
-        ))
+    /// Encode a `Decimal128` into the PostgreSQL `numeric` binary wire format.
+    ///
+    /// Layout (all big-endian; the `i32` length prefix is written by the
+    /// caller in `pgsrv::codec::server`):
+    /// ```text
+    /// i16 ndigits   number of base-10000 digit groups that follow
+    /// i16 weight    base-10000 exponent of the most-significant group (0 = units)
+    /// i16 sign      0x0000 positive, 0x4000 negative
+    /// i16 dscale    display scale (fractional decimal digits)
+    /// i16 * ndigits each group 0..=9999, most-significant first
+    /// ```
+    ///
+    /// `Decimal128` carries `value = mantissa / 10^scale`. We pad the
+    /// fractional part up to a multiple of 4 decimal digits so the decimal
+    /// point lands on a base-10000 group boundary, split into groups, and
+    /// trim trailing zero groups (PG does the same).
+    fn write_decimal(buf: &mut BytesMut, v: &Decimal128) -> Result<()> {
+        const NBASE: u128 = 10_000;
+
+        let mantissa = v.mantissa();
+        let scale = v.scale();
+
+        let sign: i16 = if mantissa < 0 { 0x4000 } else { 0x0000 };
+        // dscale (display scale) is the number of fractional decimal digits.
+        // Negative Arrow scales mean the value is scaled *up*, so dscale = 0.
+        let dscale: i16 = scale.max(0) as i16;
+
+        let mut unscaled: u128 = mantissa.unsigned_abs();
+
+        // Align the value onto base-10000 group boundaries.
+        let (frac_groups, mul_pow): (u32, u32) = if scale >= 0 {
+            let frac = scale as u32;
+            let pad = (4 - (frac % 4)) % 4;
+            ((frac + pad) / 4, pad)
+        } else {
+            // value = unscaled * 10^(-scale); no fractional groups.
+            (0, (-scale) as u32)
+        };
+        if mul_pow > 0 {
+            let factor = 10u128
+                .checked_pow(mul_pow)
+                .and_then(|f| unscaled.checked_mul(f));
+            unscaled = factor.ok_or_else(|| {
+                PgReprError::InternalError(format!(
+                    "decimal too large to encode as PG numeric: mantissa={mantissa}, scale={scale}"
+                ))
+            })?;
+        }
+
+        // Split into base-10000 groups, least-significant first.
+        let mut groups: Vec<i16> = Vec::new();
+        if unscaled != 0 {
+            while unscaled > 0 {
+                groups.push((unscaled % NBASE) as i16);
+                unscaled /= NBASE;
+            }
+        }
+        let total = groups.len() as i32;
+        // weight is the base-10000 exponent of the most-significant group.
+        // Zero stays at weight 0.
+        let weight: i16 = if total == 0 {
+            0
+        } else {
+            (total - frac_groups as i32 - 1) as i16
+        };
+
+        // Wire order is most-significant first; then drop trailing zero groups.
+        groups.reverse();
+        while matches!(groups.last(), Some(0)) {
+            groups.pop();
+        }
+
+        buf.put_i16(groups.len() as i16);
+        buf.put_i16(weight);
+        buf.put_i16(sign);
+        buf.put_i16(dscale);
+        for g in groups {
+            buf.put_i16(g);
+        }
+        Ok(())
+    }
+
+    /// Encode an interval into PG's 16-byte binary `interval` representation:
+    /// `i64` microseconds, then `i32` days, then `i32` months (all BE).
+    fn write_interval(buf: &mut BytesMut, months: i32, days: i32, micros: i64) -> Result<()> {
+        buf.put_i64(micros);
+        buf.put_i32(days);
+        buf.put_i32(months);
+        Ok(())
     }
 
     /// Override the trait default for binary format only. The default
@@ -537,9 +672,60 @@ mod tests {
         // Days since Jan 1, 2000
         assert_buf(buf, (-93_i32).to_be_bytes().as_ref());
 
-        // buf.clear();
-        // let decimal = Decimal128::new(3950123456, 6).unwrap();
-        // Writer::write_decimal(buf, &decimal).unwrap();
-        // assert_buf(buf, &[0, 3, 0, 0, 0, 0, 0, 6, 15, 110, 4, 210, 21, 224]);
+        buf.clear();
+        let decimal = Decimal128::new(3950123456, 6).unwrap();
+        Writer::write_decimal(buf, &decimal).unwrap();
+        // 3950.123456 → ndigits=3, weight=0, sign=+, dscale=6, [3950,1234,5600]
+        assert_buf(buf, &[0, 3, 0, 0, 0, 0, 0, 6, 15, 110, 4, 210, 21, 224]);
+    }
+
+    #[test]
+    fn test_binary_writer_decimal_edges() {
+        type Writer = BinaryWriter;
+        let mut buf = BytesMut::new();
+        let buf = &mut buf;
+
+        // Zero: ndigits=0, weight=0, sign=+, dscale=2, no groups.
+        buf.clear();
+        Writer::write_decimal(buf, &Decimal128::new(0, 2).unwrap()).unwrap();
+        assert_buf(buf, &[0, 0, 0, 0, 0, 0, 0, 2]);
+
+        // Plain integer (scale 0): 12345 = 1*10000 + 2345 → [1, 2345], weight=1.
+        buf.clear();
+        Writer::write_decimal(buf, &Decimal128::new(12345, 0).unwrap()).unwrap();
+        assert_buf(buf, &[0, 2, 0, 1, 0, 0, 0, 0, 0, 1, 9, 41]);
+
+        // Negative value: -3950.123456 → same digits, sign=0x4000.
+        buf.clear();
+        Writer::write_decimal(buf, &Decimal128::new(-3950123456, 6).unwrap()).unwrap();
+        assert_buf(buf, &[0, 3, 0, 0, 0x40, 0, 0, 6, 15, 110, 4, 210, 21, 224]);
+
+        // Pure fraction needing a pad: 0.5 (scale 1) → pad 3 → 5000 in the
+        // first fractional group. ndigits=1, weight=-1, dscale=1.
+        buf.clear();
+        Writer::write_decimal(buf, &Decimal128::new(5, 1).unwrap()).unwrap();
+        assert_buf(buf, &[0, 1, 255, 255, 0, 0, 0, 1, 19, 136]);
+
+        // Trailing zero group trimmed: 1.0000 (mantissa 10000, scale 4) →
+        // unscaled 10000 = [1, 0]; trailing 0 dropped → [1], weight 0, dscale 4.
+        buf.clear();
+        Writer::write_decimal(buf, &Decimal128::new(10000, 4).unwrap()).unwrap();
+        assert_buf(buf, &[0, 1, 0, 0, 0, 0, 0, 4, 0, 1]);
+    }
+
+    #[test]
+    fn test_binary_writer_interval() {
+        type Writer = BinaryWriter;
+        let mut buf = BytesMut::new();
+        let buf = &mut buf;
+
+        // 1 month, 2 days, 3 seconds → micros=3_000_000, days=2, months=1.
+        buf.clear();
+        Writer::write_interval(buf, 1, 2, 3_000_000).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(3_000_000_i64.to_be_bytes().as_ref());
+        expected.extend_from_slice(2_i32.to_be_bytes().as_ref());
+        expected.extend_from_slice(1_i32.to_be_bytes().as_ref());
+        assert_buf(buf, &expected);
     }
 }

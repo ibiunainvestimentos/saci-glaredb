@@ -1108,8 +1108,23 @@ where
             num_rows += batch.num_rows();
             for row_idx in 0..batch.num_rows() {
                 // Clone is cheapish here, all columns behind an arc.
-                conn.send(BackendMessage::DataRow(batch.clone(), row_idx))
-                    .await?;
+                if let Err(e) = conn
+                    .send(BackendMessage::DataRow(batch.clone(), row_idx))
+                    .await
+                {
+                    // A column value failed to encode (e.g. an unsupported
+                    // Arrow type, or a decimal too large for PG numeric). The
+                    // codec already rolled the partial frame back, so the
+                    // write buffer is clean — emit a classified ErrorResponse
+                    // and stop. Propagating via `?` here would instead drop
+                    // the connection mid-result, leaving the pooled client
+                    // desynced and failing every subsequent query (incl.
+                    // `SELECT 1`) until the connection ages out.
+                    let msg = e.to_string();
+                    conn.send(ErrorResponse::error(classify_sqlstate(&msg), msg).into())
+                        .await?;
+                    return Ok(None);
+                }
             }
         }
         Ok(Some(num_rows))

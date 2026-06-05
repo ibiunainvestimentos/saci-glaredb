@@ -283,6 +283,24 @@ impl Encoder<BackendMessage> for PgCodec {
     type Error = PgSrvError;
 
     fn encode(&mut self, item: BackendMessage, dst: &mut BytesMut) -> Result<()> {
+        // Encode atomically. A mid-message error (e.g. an unencodable column
+        // value) must never leave a partial frame in the write buffer: that
+        // would desync the client's wire framing for the rest of the
+        // connection (asyncpg surfaces it as "insufficient data in buffer").
+        // Roll back to the message boundary on any error so only complete
+        // frames are ever flushed; the caller is then free to send a clean
+        // ErrorResponse.
+        let start = dst.len();
+        let res = self.encode_message(item, dst);
+        if res.is_err() {
+            dst.truncate(start);
+        }
+        res
+    }
+}
+
+impl PgCodec {
+    fn encode_message(&mut self, item: BackendMessage, dst: &mut BytesMut) -> Result<()> {
         let byte = match &item {
             BackendMessage::AuthenticationOk => b'R',
             BackendMessage::AuthenticationCleartextPassword => b'R',
@@ -456,5 +474,47 @@ impl Decoder for PgCodec {
         };
 
         Ok(Some(msg))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{ArrayRef, Decimal128Array};
+    use datafusion::arrow::record_batch::RecordBatch;
+
+    use super::*;
+
+    /// A column value that fails to encode mid-row must roll the write buffer
+    /// back to the message boundary, leaving previously-encoded complete
+    /// frames intact. Otherwise a partial `DataRow` desyncs the connection
+    /// (the "insufficient data in buffer" class of bug).
+    #[test]
+    fn encode_datarow_rolls_back_partial_frame_on_error() {
+        // A Decimal128 whose binary NUMERIC encoding overflows u128 during
+        // base-10000 alignment — guaranteed to error in `write_decimal`.
+        let arr = Decimal128Array::from(vec![10_i128.pow(37)])
+            .with_precision_and_scale(38, 2)
+            .unwrap();
+        let batch =
+            RecordBatch::try_from_iter([("d", Arc::new(arr) as ArrayRef)]).unwrap();
+
+        let mut codec = PgCodec::new();
+        codec.encoding_state = vec![(PgType::NUMERIC, Format::Binary)];
+
+        let mut dst = BytesMut::new();
+        // Stand in for a previously-flushed complete frame.
+        dst.extend_from_slice(b"PRE");
+        let boundary = dst.len();
+
+        let res = codec.encode(BackendMessage::DataRow(batch, 0), &mut dst);
+        assert!(res.is_err(), "decimal overflow should fail to encode");
+        assert_eq!(
+            dst.len(),
+            boundary,
+            "buffer must be truncated back to the message boundary"
+        );
+        assert_eq!(&dst[..], b"PRE", "prior complete frame must be preserved");
     }
 }
