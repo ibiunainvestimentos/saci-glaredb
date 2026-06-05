@@ -1,0 +1,49 @@
+# Regression: Hive-partitioned Delta tables expose their partition columns
+# as Dictionary-encoded arrays at scan time. Before this fix, a SELECT that
+# projected the partition column would:
+#   1. Catalog: persist `Dictionary(UInt16, Utf8)` in `glare_catalog.columns`
+#      (now canonicalised to Utf8 by `from_arrow_fields`).
+#   2. pg_attribute: announce OID 114 (json) for that column (now OID 25 /
+#      text by the Dictionary arm in `arrow_to_pg_type_info` /
+#      `arrow_name_to_pg_oid`).
+#   3. pgwire: fall through to `Scalar::Other` for `DfScalar::Dictionary`,
+#      then `BinaryWriter::write_any` would panic and drop the connection
+#      (now handled by an explicit recursive arm in `Scalar::from_datafusion`).
+#
+# Bug surfaced in production 2026-05 on the rates_report_* family.
+# Synthetic reproduction below uses `arrow_cast` to build Dictionary
+# scalars without needing a partitioned Delta fixture.
+
+# Dictionary<UInt16, Utf8> — the exact shape delta-rs emits for string
+# partition columns. Before the fix this query would panic on encode.
+query T
+select arrow_cast('USA', 'Dictionary(UInt16, Utf8)');
+----
+USA
+
+# Dictionary over an integer scalar — covers the per-type recursion.
+query I
+select arrow_cast(42, 'Dictionary(UInt8, Int32)');
+----
+42
+
+# Multiple rows with the same dictionary type, to exercise repeated
+# encoding through the Scalar::from_datafusion arm.
+query T rowsort
+select arrow_cast(x, 'Dictionary(UInt16, Utf8)') from (values ('USA'), ('CAN'), ('USA'), ('MEX')) t(x);
+----
+CAN
+MEX
+USA
+USA
+
+# Filter on a Dictionary value — the partition-column case in production
+# (WHERE countrycode='USA').
+query T
+select c from (
+  select arrow_cast('USA', 'Dictionary(UInt16, Utf8)') as c
+  union all
+  select arrow_cast('CAN', 'Dictionary(UInt16, Utf8)') as c
+) t where c = 'USA';
+----
+USA

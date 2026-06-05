@@ -113,6 +113,7 @@ use protogen::metastore::types::options::{
     DatabaseOptionsSqlite,
     DeltaLakeCatalog,
     DeltaLakeUnityCatalog,
+    canonicalize_arrow_type,
     StorageOptions,
     TableOptionsBigQuery,
     TableOptionsCassandra,
@@ -1459,7 +1460,14 @@ impl<'a> SessionPlanner<'a> {
                                 .cloned()
                                 .unwrap_or_else(|| field.name().clone()),
                             nullable: field.is_nullable(),
-                            arrow_type: field.data_type().clone(),
+                            // Canonicalize physical-encoding wrappers
+                            // (Dictionary / RunEndEncoded) to their logical
+                            // type, matching `from_arrow_fields` for tables, so
+                            // the view never persists e.g. `Dictionary(UInt16,
+                            // Utf8)` into `glare_catalog.columns` (which would
+                            // make pg_attribute announce `json` for a text
+                            // column).
+                            arrow_type: canonicalize_arrow_type(field.data_type()),
                         })
                         .collect();
                     Ok(CreateView {

@@ -108,6 +108,15 @@ impl Scalar {
     /// or non-numeric scalars. Narrowing arms exist only for completeness (the
     /// observed divergence is always logical-wider-than-physical); they keep
     /// wire framing consistent rather than ever desyncing the connection.
+    ///
+    /// This is a *safety net*, not the root fix. The real divergence is that
+    /// `PreparedStatement::build` announces the `RowDescription` from the
+    /// pre-analyzer plan while execution runs the full analyzer pipeline; if
+    /// the two ever disagree on a column's type, this keeps the wire framed.
+    /// `pgsrv::handler::stream_batch` logs a tripwire whenever this actually
+    /// fires. If that warning shows up in the wild, the proper fix is to derive
+    /// the announced schema from the analyzed/optimized plan (so announce ==
+    /// data by construction) rather than relying on this corrector.
     fn coerce_numeric_to(self, as_type: &PgType) -> Scalar {
         match self {
             Self::Int2(v) if *as_type == PgType::INT4 => Self::Int4(v as i32),

@@ -1086,8 +1086,13 @@ where
         mut stream: SendableRecordBatchStream,
         encoding_state: Vec<(PgType, Format)>,
     ) -> Result<Option<usize>> {
+        // Capture the announced output OIDs before handing `encoding_state`
+        // to the codec, so the tripwire below can compare them against the
+        // arrow types the executor actually produces.
+        let announced_oids: Vec<u32> = encoding_state.iter().map(|(t, _)| t.oid()).collect();
         conn.set_encoding_state(encoding_state);
         let mut num_rows = 0;
+        let mut types_checked = false;
         while let Some(result) = stream.next().await {
             let batch = match result {
                 Ok(r) => r,
@@ -1105,6 +1110,38 @@ where
                     return Ok(None);
                 }
             };
+            // Tripwire (once per query): the RowDescription OIDs are announced
+            // from the *pre-analyzer* plan (PreparedStatement::build →
+            // plan.output_schema()), while these batches come from the fully
+            // analyzed/optimized plan. If an analyzer rule changes a column's
+            // type after Describe, the announced OID and the executed arrow
+            // type diverge — which would desync binary clients (asyncpg:
+            // "insufficient data in buffer"). `pgrepr::scalar::coerce_numeric_to`
+            // silently width-corrects the value so the wire never desyncs;
+            // this warning makes any such divergence observable so the root
+            // cause can be fixed (e.g. announcing from the analyzed plan)
+            // rather than relying on the corrector indefinitely. Expected to
+            // stay silent in steady state.
+            if !types_checked {
+                types_checked = true;
+                for (i, col) in batch.columns().iter().enumerate() {
+                    if let Some(&announced) = announced_oids.get(i) {
+                        let actual = pgrepr::pg_type_oid::arrow_to_pg_oid(col.data_type());
+                        if announced != actual {
+                            warn!(
+                                column = i,
+                                announced_oid = announced,
+                                actual_oid = actual,
+                                actual_arrow_type = ?col.data_type(),
+                                "pgwire announce/data type mismatch: RowDescription \
+                                 announced OID {announced} but the executed column is \
+                                 oid {actual}. Value is being width-coerced to avoid a \
+                                 wire desync — investigate the planner/analyzer type path."
+                            );
+                        }
+                    }
+                }
+            }
             num_rows += batch.num_rows();
             for row_idx in 0..batch.num_rows() {
                 // Clone is cheapish here, all columns behind an arc.

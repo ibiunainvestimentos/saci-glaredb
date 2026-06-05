@@ -41,6 +41,11 @@ b  text
 # storage_*.T → <X>.T columns); the schema-capture-at-plan-time fix
 # does, because DataFusion resolves the result type during
 # `query_to_plan`.
+#
+# Note `next_id` (= int4 column `a` + the literal `1`) resolves to int8:
+# DataFusion types integer literals as Int64, and `Int32 + Int64` coerces to
+# Int64. This matches GlareDB's native behaviour. (`SELECT a + 1::int` would
+# stay int4 — an explicit cast controls the literal's type.)
 # ----------------------------------------------------------------------
 statement ok
 create view view_computed as
@@ -59,7 +64,7 @@ where n.nspname = 'views_pg_attribute_test'
 order by a.attnum;
 ----
 id       int4
-next_id  int4
+next_id  int8
 wide_id  int8
 
 # ----------------------------------------------------------------------

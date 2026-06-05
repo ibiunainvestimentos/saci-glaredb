@@ -21,6 +21,33 @@ pub struct InternalColumnDefinition {
     pub arrow_type: DataType,
 }
 
+/// Strip physical-encoding wrappers (`Dictionary`, `RunEndEncoded`) from an
+/// Arrow `DataType`, returning the underlying logical type.
+///
+/// Catalog rows feed `pg_attribute`, ibis, dbeaver, et al. — surfaces that
+/// model schema in *logical* terms. Dictionary-encoded `Utf8` is still
+/// semantically text; persisting it as `Dictionary(UInt16, Utf8)` makes the
+/// OID lookup resolve to `json` (114) and breaks every Postgres-wire client.
+/// Recurses through chained wrappers (`Dictionary<UInt8, Dictionary<UInt16, Utf8>>`
+/// is unusual but well-defined → `Utf8`).
+///
+/// Public so the CREATE VIEW planner (`session_planner.rs`) can canonicalize
+/// the captured view `column_types` the same way `from_arrow_fields` does for
+/// tables — otherwise a view over a Hive-partitioned source could persist a
+/// `Dictionary` into `glare_catalog.columns`.
+pub fn canonicalize_arrow_type(t: &DataType) -> DataType {
+    match t {
+        // Dictionary<K, V> is a physical encoding of V; the catalog stores V.
+        DataType::Dictionary(_, value) => canonicalize_arrow_type(value),
+        // RunEndEncoded<run_ends_field, values_field> wraps the values field's
+        // type with run-length encoding. The catalog stores the values type.
+        DataType::RunEndEncoded(_, value_field) => {
+            canonicalize_arrow_type(value_field.data_type())
+        }
+        other => other.clone(),
+    }
+}
+
 impl InternalColumnDefinition {
     /// Create a vec of column definitions.
     ///
@@ -41,13 +68,27 @@ impl InternalColumnDefinition {
     }
 
     /// Create an iterator of column definitions from arrow fields.
+    ///
+    /// The catalog represents *logical* Postgres-facing types. Arrow producers
+    /// sometimes hand us *physical-encoding* wrappers — `Dictionary<K, V>` for
+    /// low-cardinality columns (delta-rs emits this for partition cols on its
+    /// `arrow_schema()` path), `RunEndEncoded<RE, V>` for run-length data —
+    /// that mean "the underlying logical type is V, transported with this
+    /// encoding." If we persist the wrapper, downstream surfaces choke:
+    /// `arrow_name_to_pg_oid("Dictionary")` returns OID 114 (json), so
+    /// `pg_attribute` announces a Utf8-backed column as JSON, the executor
+    /// then returns a `DictionaryArray`, and `Scalar::from_datafusion` has no
+    /// arm for it. This is the regression that black-holed every dashboard
+    /// reading `rates_report_series.countrycode` in 2026-05-11.
+    ///
+    /// Canonicalise here so the catalog only ever stores the logical V.
     pub fn from_arrow_fields(
         fields: &Fields,
     ) -> impl Iterator<Item = InternalColumnDefinition> + '_ {
         fields.into_iter().map(|field| InternalColumnDefinition {
             name: field.name().clone(),
             nullable: field.is_nullable(),
-            arrow_type: field.data_type().clone(),
+            arrow_type: canonicalize_arrow_type(field.data_type()),
         })
     }
 
@@ -2142,4 +2183,99 @@ pub struct CopyToFormatOptionsLance {
     pub max_rows_per_group: Option<usize>,
     pub max_bytes_per_file: Option<usize>,
     pub input_batch_size: Option<usize>,
+}
+
+#[cfg(test)]
+mod canonicalize_arrow_type_tests {
+    use datafusion::arrow::datatypes::{DataType, Field};
+
+    use super::{canonicalize_arrow_type, InternalColumnDefinition};
+
+    /// The regression that took down `rates_report_*` dashboards: partition
+    /// columns landed in `glare_catalog.columns` as
+    /// `Dictionary(UInt16, Utf8)`. After canonicalisation they must store
+    /// just the value type.
+    #[test]
+    fn canonicalize_dictionary_unwraps_to_value_type() {
+        let dict = DataType::Dictionary(
+            Box::new(DataType::UInt16),
+            Box::new(DataType::Utf8),
+        );
+        assert_eq!(canonicalize_arrow_type(&dict), DataType::Utf8);
+    }
+
+    #[test]
+    fn canonicalize_dictionary_with_parametric_value() {
+        let dict = DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(DataType::Decimal128(10, 2)),
+        );
+        assert_eq!(canonicalize_arrow_type(&dict), DataType::Decimal128(10, 2));
+    }
+
+    /// Nested dictionaries are pathological but well-defined — peel both
+    /// layers.
+    #[test]
+    fn canonicalize_dictionary_recurses() {
+        let inner = DataType::Dictionary(
+            Box::new(DataType::UInt16),
+            Box::new(DataType::Utf8),
+        );
+        let outer = DataType::Dictionary(Box::new(DataType::UInt8), Box::new(inner));
+        assert_eq!(canonicalize_arrow_type(&outer), DataType::Utf8);
+    }
+
+    #[test]
+    fn canonicalize_run_end_encoded_unwraps_to_value_type() {
+        let ree = DataType::RunEndEncoded(
+            std::sync::Arc::new(Field::new("run_ends", DataType::Int32, false)),
+            std::sync::Arc::new(Field::new("values", DataType::Utf8, true)),
+        );
+        assert_eq!(canonicalize_arrow_type(&ree), DataType::Utf8);
+    }
+
+    /// Logical types pass through unchanged.
+    #[test]
+    fn canonicalize_passes_through_logical_types() {
+        for ty in [
+            DataType::Utf8,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Decimal128(10, 2),
+            DataType::Date32,
+            DataType::Boolean,
+        ] {
+            assert_eq!(canonicalize_arrow_type(&ty), ty);
+        }
+    }
+
+    /// `from_arrow_fields` is the catalog-write boundary; it must
+    /// canonicalise every field's type so the metastore never sees a
+    /// physical-encoding wrapper.
+    #[test]
+    fn from_arrow_fields_canonicalises() {
+        use datafusion::arrow::datatypes::Fields;
+
+        let fields: Fields = vec![
+            Field::new("ticker", DataType::Utf8, true),
+            Field::new(
+                "countrycode",
+                DataType::Dictionary(
+                    Box::new(DataType::UInt16),
+                    Box::new(DataType::Utf8),
+                ),
+                true,
+            ),
+            Field::new("year", DataType::Int32, true),
+        ]
+        .into();
+
+        let cols: Vec<InternalColumnDefinition> =
+            InternalColumnDefinition::from_arrow_fields(&fields).collect();
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0].arrow_type, DataType::Utf8);
+        // Partition col: stripped from Dictionary to Utf8.
+        assert_eq!(cols[1].arrow_type, DataType::Utf8);
+        assert_eq!(cols[2].arrow_type, DataType::Int32);
+    }
 }

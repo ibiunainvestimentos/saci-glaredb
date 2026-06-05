@@ -247,8 +247,18 @@ static TEXT: &PgTypeInfo = &PG_TYPES[9]; // OID 25 — fallback for unknown
 /// into the element type and resolve to that element's array companion when
 /// available, falling back to `text` for elements with no array OID.
 ///
-/// `Struct`, `Map`, `Dictionary`, `Union`, `RunEndEncoded` are serialised as
-/// JSON over the wire (see `pgrepr::scalar`), so they map to `json` (OID 114).
+/// `Struct`, `Map`, `Union` are serialised as JSON over the wire (see
+/// `pgrepr::scalar`), so they map to `json` (OID 114).
+///
+/// `Dictionary<K, V>` and `RunEndEncoded<RE, V>` are *physical encodings* of
+/// `V`, not nested logical types. We recurse into the value type so they
+/// announce as whatever PG type `V` would — e.g. `Dictionary<UInt16, Utf8>`
+/// resolves to OID 25 (`text`). Without this recursion, partition columns
+/// from Hive-partitioned Delta tables (which delta-rs emits as
+/// `Dictionary<UInt16, Utf8>` at scan time) get announced as `json` (OID 114),
+/// then `Scalar::from_datafusion` has no Dictionary arm, falls through to
+/// `Scalar::Other`, and `BinaryWriter::write_any` panics. This is the
+/// regression that took out every dashboard on `rates_report_*` in 2026-05.
 pub fn arrow_to_pg_type_info(t: &ArrowType) -> &'static PgTypeInfo {
     match t {
         ArrowType::Null => pg_type_by_oid(25).unwrap_or(TEXT),
@@ -273,6 +283,12 @@ pub fn arrow_to_pg_type_info(t: &ArrowType) -> &'static PgTypeInfo {
         ArrowType::Timestamp(_, None) => pg_type_by_oid(1114).unwrap_or(TEXT),
         ArrowType::Timestamp(_, Some(_)) => pg_type_by_oid(1184).unwrap_or(TEXT),
         ArrowType::Duration(_) | ArrowType::Interval(_) => pg_type_by_oid(1186).unwrap_or(TEXT),
+        // Physical encodings — recurse on the value type so the wire OID
+        // matches what the executor actually delivers.
+        ArrowType::Dictionary(_, value) => arrow_to_pg_type_info(value),
+        ArrowType::RunEndEncoded(_, value_field) => {
+            arrow_to_pg_type_info(value_field.data_type())
+        }
         // All nested Arrow types serialise as JSON text on the wire (see the
         // `Scalar::from_datafusion` Struct/List branch in `pgrepr::scalar`).
         // Postgres arrays use `{1,2,3}` text format — *not* JSON — so we
@@ -287,9 +303,7 @@ pub fn arrow_to_pg_type_info(t: &ArrowType) -> &'static PgTypeInfo {
         | ArrowType::FixedSizeList(_, _)
         | ArrowType::Struct(_)
         | ArrowType::Map(_, _)
-        | ArrowType::Dictionary(_, _)
-        | ArrowType::Union(_, _)
-        | ArrowType::RunEndEncoded(_, _) => pg_type_by_oid(114).unwrap_or(TEXT),
+        | ArrowType::Union(_, _) => pg_type_by_oid(114).unwrap_or(TEXT),
     }
 }
 
@@ -305,6 +319,11 @@ pub fn arrow_to_pg_oid(t: &ArrowType) -> u32 {
 /// Accepts the leading identifier of a parametric type — `"Decimal128(10, 2)"`
 /// matches as `"Decimal128"`, `"Timestamp(Microsecond, None)"` matches as
 /// `"Timestamp"` etc.
+///
+/// `Dictionary(K, V)` recurses into V so the OID matches the underlying
+/// logical type. Mirrors `arrow_to_pg_type_info`'s treatment — without this,
+/// a Hive-partition `Dictionary(UInt16, Utf8)` row in `glare_catalog.columns`
+/// resolves to `json` (114) and pgwire announces JSON for a text column.
 pub fn arrow_name_to_pg_oid(name: &str) -> u32 {
     let head = name.split(['(', '<']).next().unwrap_or(name).trim();
     match head {
@@ -329,13 +348,52 @@ pub fn arrow_name_to_pg_oid(name: &str) -> u32 {
             }
         }
         "Duration" | "Interval" => 1186,
+        // Dictionary<K, V> is a physical wrapper around V — recurse so e.g.
+        // "Dictionary(UInt16, Utf8)" → OID 25 (text), matching what
+        // `arrow_to_pg_type_info` does for the runtime ArrowType. Walks paren
+        // depth because V can itself be parametric — `Dictionary(Int32,
+        // Decimal128(10, 2))` must split on the comma after Int32, not on
+        // the comma inside Decimal128.
+        "Dictionary" => {
+            if let Some(start) = name.find('(') {
+                if let Some(end) = name.rfind(')') {
+                    if end > start {
+                        let inner = &name[start + 1..end];
+                        if let Some(comma) = split_top_level_comma(inner) {
+                            let value = inner[comma + 1..].trim();
+                            return arrow_name_to_pg_oid(value);
+                        }
+                    }
+                }
+            }
+            114
+        }
         // All nested Arrow types are JSON-on-wire — see arrow_to_pg_type_info
         // for the rationale (PG arrays use `{}` text, not JSON).
         "List" | "LargeList" | "FixedSizeList" => 114,
-        "Struct" | "Map" | "Dictionary" | "Union" | "RunEndEncoded" => 114,
+        "Struct" | "Map" | "Union" | "RunEndEncoded" => 114,
         "Null" => 25,
         _ => 25,
     }
+}
+
+/// Find the index of the first top-level comma in `s` — i.e. one that lives
+/// at paren depth zero. Returns `None` if no such comma exists.
+///
+/// Used by `arrow_name_to_pg_oid`'s `Dictionary` arm to split
+/// `"K, V"` correctly even when `V` is itself parametric and contains its
+/// own commas inside its parens.
+fn split_top_level_comma(s: &str) -> Option<usize> {
+    let mut depth: i32 = 0;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' | '<' => depth += 1,
+            ')' | '>' => depth -= 1,
+            ',' if depth == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -467,5 +525,95 @@ mod tests {
         assert_eq!(arrow_name_to_pg_oid("List<Int32>"), 114);
         assert_eq!(arrow_name_to_pg_oid("Struct"), 114);
         assert_eq!(arrow_name_to_pg_oid("definitely-not-a-type"), 25);
+    }
+
+    /// Regression: `silver_securities.rates_report_series` had its
+    /// partition column `countrycode` persisted as `Dictionary(UInt16, Utf8)`.
+    /// `arrow_name_to_pg_oid` previously announced this as OID 114 (json),
+    /// which broke every dashboard reading the column. Dictionary should
+    /// announce as the value type's OID.
+    #[test]
+    fn arrow_to_pg_oid_dictionary_recurses_into_value_type() {
+        let dict_utf8 = ArrowType::Dictionary(
+            Box::new(ArrowType::UInt16),
+            Box::new(ArrowType::Utf8),
+        );
+        assert_eq!(arrow_to_pg_oid(&dict_utf8), 25);
+
+        let dict_int = ArrowType::Dictionary(
+            Box::new(ArrowType::Int32),
+            Box::new(ArrowType::Int64),
+        );
+        assert_eq!(arrow_to_pg_oid(&dict_int), 20);
+
+        let dict_decimal = ArrowType::Dictionary(
+            Box::new(ArrowType::Int32),
+            Box::new(ArrowType::Decimal128(10, 2)),
+        );
+        assert_eq!(arrow_to_pg_oid(&dict_decimal), 1700);
+
+        // Doubly-wrapped dictionaries are unusual but well-defined; the
+        // recursion should peel both layers.
+        let dict_dict = ArrowType::Dictionary(
+            Box::new(ArrowType::UInt8),
+            Box::new(ArrowType::Dictionary(
+                Box::new(ArrowType::UInt16),
+                Box::new(ArrowType::Utf8),
+            )),
+        );
+        assert_eq!(arrow_to_pg_oid(&dict_dict), 25);
+    }
+
+    #[test]
+    fn arrow_to_pg_oid_run_end_encoded_recurses_into_value_type() {
+        // RunEndEncoded<run_ends_field, values_field> wraps the values
+        // field's logical type. Recurse so the OID matches what the wire
+        // delivers, not what the run-length encoding looks like.
+        let ree_utf8 = ArrowType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", ArrowType::Int32, false)),
+            Arc::new(Field::new("values", ArrowType::Utf8, true)),
+        );
+        assert_eq!(arrow_to_pg_oid(&ree_utf8), 25);
+    }
+
+    /// `arrow_name_to_pg_oid` operates on the Debug-rendered Arrow string
+    /// stored in `glare_catalog.columns`. For `Dictionary(K, V)` the value
+    /// can itself be parametric, so the split must walk paren depth — a
+    /// naive first-comma split on `Dictionary(Int32, Decimal128(10, 2))`
+    /// would extract the wrong value name.
+    #[test]
+    fn arrow_name_to_pg_oid_dictionary_recurses_into_value_type() {
+        assert_eq!(arrow_name_to_pg_oid("Dictionary(UInt16, Utf8)"), 25);
+        assert_eq!(arrow_name_to_pg_oid("Dictionary(Int32, Int64)"), 20);
+        assert_eq!(
+            arrow_name_to_pg_oid("Dictionary(Int32, Decimal128(10, 2))"),
+            1700
+        );
+        assert_eq!(
+            arrow_name_to_pg_oid("Dictionary(Int32, Timestamp(Microsecond, None))"),
+            1114
+        );
+        // Doubly-wrapped — recursion peels both layers.
+        assert_eq!(
+            arrow_name_to_pg_oid("Dictionary(UInt8, Dictionary(UInt16, Utf8))"),
+            25
+        );
+        // Malformed input falls back to OID 114 (json), matching the
+        // prior nested-type catch-all behaviour.
+        assert_eq!(arrow_name_to_pg_oid("Dictionary"), 114);
+        assert_eq!(arrow_name_to_pg_oid("Dictionary(NoCommaInside)"), 114);
+    }
+
+    #[test]
+    fn split_top_level_comma_walks_paren_depth() {
+        assert_eq!(split_top_level_comma("Int32, Utf8"), Some(5));
+        assert_eq!(
+            split_top_level_comma("Int32, Decimal128(10, 2)"),
+            Some(5)
+        );
+        // Comma inside parens does NOT split.
+        assert_eq!(split_top_level_comma("Decimal128(10, 2)"), None);
+        // No comma at all.
+        assert_eq!(split_top_level_comma("Utf8"), None);
     }
 }

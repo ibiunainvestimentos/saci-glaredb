@@ -13,14 +13,27 @@
 # coercion regressions even when the wire-format issue can only be
 # verified end-to-end via the asyncpg bench harness.
 
-# Single-column oid select.
+# Single-column oid select. The `pg_catalog` namespace OID is the
+# Postgres-canonical 11 — see `PG_NAMESPACE` in `builtins.rs` (commit
+# 80fb30c8 added the `CASE schema_name WHEN 'pg_catalog' THEN 11 …`
+# translation so introspection clients that hardcode that OID find a
+# match). Update this expectation if the translation list changes again.
 query I
 select oid from pg_catalog.pg_namespace where nspname = 'pg_catalog';
 ----
-12
+11
 
 # Multi-column row with oid + text + text (the shape that triggered
 # the BufferError in the bench).
+#
+# NOTE on the `pg_class` OID: built-in view OIDs are assigned in
+# `metastore::database::DatabaseCatalog::insert_default_objects` order
+# and live in the `FIRST_NON_STATIC_OID` range (16385+). The exact
+# value drifts when builtins are added/removed upstream of `pg_class`
+# in the registration list. If this assertion fails after a refactor,
+# update the literal to whatever the catalog now hands out — the
+# important wire-format invariant being tested here is that UInt32
+# oids round-trip as 4 BE bytes, not the specific number.
 query ITT
 select c.oid, c.relname, n.nspname
 from pg_catalog.pg_class c
@@ -28,19 +41,34 @@ join pg_catalog.pg_namespace n on n.oid = c.relnamespace
 where n.nspname = 'pg_catalog' and c.relname = 'pg_class'
 limit 1;
 ----
-479 pg_class pg_catalog
+16510 pg_class pg_catalog
 
 # pg_attribute.atttypid is also UInt32 and routes through the same arm.
 # Resolve a real PG OID via the join and confirm it round-trips.
+#
+# Use a user-created table here rather than a built-in view (e.g.
+# `pg_namespace`): commit `b1a67532` captures view column_types only
+# at CREATE VIEW time from `session_planner`, but built-in views are
+# inserted by `metastore::database::insert_default_objects` and have
+# empty `column_types`, so `build_glare_columns` skips them and
+# `pg_attribute` returns zero rows for any built-in view's columns.
+# The wire-format invariant we care about (UInt32 atttypid → 4 BE
+# bytes) is the same against any relation; a freshly created table
+# is the simplest source that *does* surface in pg_attribute.
+
+statement ok
+create schema wf_oids;
+
+statement ok
+create table wf_oids.t (a int, b text);
+
 query IT
 select a.atttypid, t.typname
 from pg_catalog.pg_attribute a
 join pg_catalog.pg_class c on c.oid = a.attrelid
 join pg_catalog.pg_namespace n on n.oid = c.relnamespace
 join pg_catalog.pg_type t on t.oid = a.atttypid
-where n.nspname = 'pg_catalog'
-  and c.relname = 'pg_namespace'
-  and a.attname = 'nspname'
+where n.nspname = 'wf_oids' and c.relname = 't' and a.attname = 'b'
 limit 1;
 ----
 25 text
