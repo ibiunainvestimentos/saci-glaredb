@@ -33,6 +33,7 @@ use protogen::rpcsrv::types::service::{
 use sqlbuiltins::builtins::DEFAULT_CATALOG;
 use sqlbuiltins::functions::{BuiltinScalarUDF, FunctionRegistry};
 use tokio_postgres::types::Type as PgType;
+use tracing::debug;
 use uuid::Uuid;
 
 use super::{new_datafusion_runtime_env, new_datafusion_session_config_opts};
@@ -378,6 +379,19 @@ impl LocalSessionContext {
             ));
         }
 
+        // SACI: cross-session staleness guard. Another session's DDL — on
+        // every saciflow NVMe sync: CREATE OR REPLACE VIEW (DDL-skip path)
+        // or CREATE OR REPLACE EXTERNAL TABLE (re-register path); either
+        // bumps the shared metastore version_hint synchronously at commit,
+        // but a client that reuses a prepared statement only ever sends
+        // Bind — `prepare_statement`'s refresh never runs in THIS session,
+        // and the cached plan replays a Delta provider whose snapshot can
+        // reference files the writer already pruned ("Object at location
+        // ... not found", prod 2026-06-11). The check below is one atomic
+        // load when nothing changed; the swap + per-statement re-plan only
+        // runs when the catalog actually advanced.
+        self.maybe_refresh_state().await?;
+
         // If the post-DDL hook flagged the prepared cache as stale,
         // re-plan the cached PreparedStatement here so the portal
         // doesn't replay a frozen pre-DDL plan. This catches asyncpg's
@@ -408,6 +422,26 @@ impl LocalSessionContext {
                 };
                 let fresh = PreparedStatement::build(Some(inner_stmt), self).await?;
                 self.prepared.insert(name, fresh);
+            }
+        }
+
+        // SACI: targeted re-plan when the statement was planned against an
+        // older catalog than the (possibly just-swapped) current one. Only
+        // the statement being bound is rebuilt; in-flight portals are left
+        // untouched.
+        let needs_replan = self
+            .prepared
+            .get(stmt_name)
+            .is_some_and(|p| p.stmt.is_some() && p.catalog_version != self.catalog.version());
+        if needs_replan {
+            if let Some(inner) = self
+                .prepared
+                .get(stmt_name)
+                .and_then(|p| p.stmt.as_ref().cloned())
+            {
+                debug!(%stmt_name, "re-planning prepared statement against newer catalog");
+                let fresh = PreparedStatement::build(Some(inner), self).await?;
+                self.prepared.insert(stmt_name.to_string(), fresh);
             }
         }
 
@@ -553,6 +587,12 @@ pub struct PreparedStatement {
     /// The logical plan for the statement. Is `Some` if the statement is
     /// `Some`.
     pub(crate) plan: Option<LogicalPlan>,
+    /// SACI: catalog version this statement was planned against. A plan
+    /// freezes resolved table providers (for Delta tables: the snapshot's
+    /// file list), so replaying it after another session's DDL bumped the
+    /// catalog can read files an external writer already pruned.
+    /// `bind_statement` re-plans when this lags the session catalog.
+    pub(crate) catalog_version: u64,
     /// Parameter data types.
     pub(crate) parameter_types: Option<HashMap<String, Option<(PgType, DataType)>>>,
     /// The output schema of the statement if it produces an output.
@@ -598,6 +638,7 @@ impl PreparedStatement {
             Ok(PreparedStatement {
                 stmt: Some(inner),
                 plan: Some(plan),
+                catalog_version: ctx.get_session_catalog().version(),
                 parameter_types: Some(parameter_types),
                 output_schema: schema,
                 output_pg_types: pg_types,
@@ -607,6 +648,7 @@ impl PreparedStatement {
             Ok(PreparedStatement {
                 stmt: None,
                 plan: None,
+                catalog_version: ctx.get_session_catalog().version(),
                 parameter_types: None,
                 output_schema: None,
                 output_pg_types: Vec::new(),
